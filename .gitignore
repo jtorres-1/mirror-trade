@@ -1,0 +1,13 @@
+.env
+po_storage.json
+*.session*
+venv/
+__pycache__/
+*.pyc
+.playwright/
+logs/
+trade_log.csv
+executed_trades.csv
+trade_history.csv
+.DS_Store
+.vscode/
