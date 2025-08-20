@@ -69,7 +69,7 @@ def parse_signal(text: str) -> Optional[Dict]:
     d = {"pair": None, "direction": None, "expiry_min": None, "entry_time": None, "ml_levels": []}
     m_pair = PAIR_RE.search(norm.upper())
     if m_pair:
-        d["pair"] = m_pair.group(1)
+        d["pair"] = d.get("pair") or m_pair.group(1)
     lines = [ln.strip() for ln in norm.splitlines() if ln.strip()]
     for ln in lines:
         up = ln.upper()
@@ -181,6 +181,12 @@ async def schedule_entry(entry_time: str):
             current.update({"active":False,"pair":None,"direction":None,"ml_levels":[],"ml_i":0,"amount":base_amount})
             return
         next_t = current["ml_levels"][current["ml_i"]]; current["ml_i"] += 1
+        # hard stop at ML2 (blocks ML3+)
+        if current["ml_i"] >= 3:
+            print("[ML] ML3 disabled; chain ends at ML2.")
+            current.update({"active":False,"pair":None,"direction":None,"ml_levels":[],
+                            "ml_i":0,"amount":base_amount})
+            return
         next_amt = round(current["amount"] * mg_mult, 2)
         current["amount"] = min(next_amt, MAX_STAKE)
         if current["amount"] < next_amt:

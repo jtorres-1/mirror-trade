@@ -4,7 +4,7 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 PO_URL_LOGIN   = "https://pocketoption.com/en/login/"
 PO_URL_CABINET = "https://pocketoption.com/en/cabinet/"
-PO_URL_TRADE   = "https://pocketoption.com/en/cabinet/demo-quick-high-low/"
+PO_URL_TRADE   = "https://pocketoption.com/en/cabinet/"
 
 SEL = {
     "amount_box": "#put-call-buttons-chart-1 >> role=textbox",
