@@ -1,12 +1,10 @@
-# listen.py — Telegram -> PocketOption with martingale
-import os, re, csv, asyncio, sys
-from datetime import datetime, timedelta, timezone
+# listen.py — Telegram -> PocketOption with martingale (using executor results + ML cancel fix)
+import os, re, csv, asyncio, sys, requests
+from datetime import datetime, timedelta
 from typing import Optional, Dict
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
-
-from po_executor import PocketOptionExecutor
 
 load_dotenv()
 
@@ -17,20 +15,11 @@ phone = os.getenv("PHONE_NUMBER")
 session_name = os.getenv("SESSION_NAME", "mirrortrade")
 channel = os.getenv("CHANNEL")  # e.g. "@yousefftraderusa"
 
-# Minutes to ADD to LOCAL to get ET (NY). Using abs so -180 or 180 both work.
 tz_offset_minutes = abs(int(os.getenv("TZ_OFFSET_MIN", "180")))
-
 FORCE_OTC = os.getenv("FORCE_OTC", "1") == "1"
 base_amount = float(os.getenv("TRADE_AMOUNT", "1"))
 mg_mult = float(os.getenv("MARTINGALE_MULT", "2.2"))
-PO_EMAIL = os.getenv("PO_EMAIL")
-PO_PASSWORD = os.getenv("PO_PASSWORD")
-NO_BACKFILL = "--no-backfill" in sys.argv
-
-# --- NEW: cap any single stake (max-stake guard) ---
 MAX_STAKE = float(os.getenv("MAX_STAKE", "10.65"))
-
-# --- NEW: daily stop-loss (0 disables) ---
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
 
 if channel and not channel.startswith("@"):
@@ -38,7 +27,6 @@ if channel and not channel.startswith("@"):
 
 # --- Clients ---
 client = TelegramClient(session_name, api_id, api_hash)
-executor = PocketOptionExecutor(PO_EMAIL, PO_PASSWORD, headless=False)
 
 # --- Logging ---
 LOG_FILE = "trade_log.csv"
@@ -131,7 +119,10 @@ def et_day_key() -> str:
 current = {"active": False,"pair": None,"direction": None,"expiry_min": 5,
            "ml_levels": [],"ml_i": 0,"amount": base_amount}
 last_signal_utc: Optional[datetime] = None
-seen_ids = set()  # NEW
+seen_ids = set()
+
+# Track scheduled ML tasks
+scheduled_tasks = []
 
 # --- Daily PnL + halt flag ---
 daily_pnl = 0.0
@@ -141,69 +132,79 @@ async def sleep_until(when: datetime):
     delay = max(0, (when - datetime.now()).total_seconds())
     await asyncio.sleep(delay)
 
-async def run_one_trade(pair: str, direction: str, expiry_min: int, amount: float):
+# --- Run one trade via Node executor ---
+async def run_one_trade(pair: str, direction: str, expiry_min: int, amount: float) -> bool:
     clean_pair = pair
     if FORCE_OTC and "OTC" not in clean_pair.upper():
         clean_pair = f"{clean_pair} OTC"
-    await executor.select_pair(clean_pair)
-    await executor.place_trade(clean_pair, direction, expiry_min, amount)
-    await asyncio.sleep(expiry_min * 60 + 8)
-    profit = await executor.last_closed_profit()
-    won = profit > 0.0
-    log_trade(clean_pair, direction, expiry_min, amount, "WIN" if won else "LOSS", profit)
-    print(f"[RESULT] {clean_pair} {direction} amount={amount} profit={profit} {'WIN' if won else 'LOSS'}")
-    global daily_pnl, halted_for_day
-    daily_pnl += profit
-    if DAILY_STOP_LOSS > 0 and daily_pnl <= -DAILY_STOP_LOSS and not halted_for_day:
-        halted_for_day = True
-        print(f"[HALT] Daily stop-loss hit: PnL {daily_pnl:.2f} ≤ -{DAILY_STOP_LOSS:.2f}. Halting for today (ET).")
-    return won
+
+    try:
+        res = requests.post(
+            "http://localhost:3000/trade",
+            json={"pair": clean_pair, "amount": amount, "direction": direction.lower()},
+            timeout=60
+        )
+        if res.status_code == 200:
+            data = res.json()
+            result = data.get("result", "UNKNOWN")
+            profit = float(data.get("profit", 0))
+            log_trade(clean_pair, direction, expiry_min, amount, result, profit)
+            print(f"[API] Trade done: {direction} {clean_pair} ${amount} → {result} ({profit})")
+            return result == "WIN"
+        else:
+            print(f"[API ERROR] {res.status_code}: {res.text}")
+    except Exception as e:
+        print(f"[API EXCEPTION] Failed to reach Node executor: {e}")
+
+    log_trade(clean_pair, direction, expiry_min, amount, "ERROR", 0.0)
+    return False
 
 async def schedule_entry(entry_time: str):
+    global current, scheduled_tasks
     if DAILY_STOP_LOSS > 0 and halted_for_day:
         print("[HALT] Daily stop-loss reached; skip scheduled entry.")
         return
     tgt_local = to_next_or_now(entry_time)
     print(f"[TIME] ET {entry_time} -> local {tgt_local.strftime('%Y-%m-%d %H:%M:%S')}  now {datetime.now()}")
     await sleep_until(tgt_local)
+
     pair = current["pair"]; direction = current["direction"]; expiry = current["expiry_min"]
     amt = min(current["amount"], MAX_STAKE)
-    if amt != current["amount"]:
-        print(f"[CAP] Amount capped to {amt} (MAX_STAKE={MAX_STAKE})")
     print(f"[EXECUTE] {pair} {direction} {expiry}m amount {amt} @ {datetime.now().strftime('%H:%M:%S')}")
     won = await run_one_trade(pair, direction, expiry, amt)
+
     if won:
+        print("[ML] WIN → reset to base amount & cancel ML chain")
+        for t in scheduled_tasks:
+            if not t.done():
+                t.cancel()
+        scheduled_tasks.clear()
         current.update({"active":False,"pair":None,"direction":None,"ml_levels":[],"ml_i":0,"amount":base_amount})
         return
-    if current["ml_i"] < len(current["ml_levels"]):
-        if DAILY_STOP_LOSS > 0 and halted_for_day:
-            print("[HALT] Stop-loss reached; aborting remaining ML steps.")
-            current.update({"active":False,"pair":None,"direction":None,"ml_levels":[],"ml_i":0,"amount":base_amount})
-            return
-        next_t = current["ml_levels"][current["ml_i"]]; current["ml_i"] += 1
-        # hard stop at ML2 (blocks ML3+)
-        if current["ml_i"] >= 3:
-            print("[ML] ML3 disabled; chain ends at ML2.")
-            current.update({"active":False,"pair":None,"direction":None,"ml_levels":[],
-                            "ml_i":0,"amount":base_amount})
-            return
-        next_amt = round(current["amount"] * mg_mult, 2)
-        current["amount"] = min(next_amt, MAX_STAKE)
-        if current["amount"] < next_amt:
-            print(f"[CAP] ML amount capped to {current['amount']} (MAX_STAKE={MAX_STAKE})")
-        print(f"[ML] Scheduling ML{current['ml_i']} at {next_t} amount={current['amount']}")
-        await schedule_entry(next_t)
     else:
-        print("[ML] No ML levels left. Chain ends.")
-        current.update({"active":False,"pair":None,"direction":None,"ml_levels":[],"ml_i":0,"amount":base_amount})
+        if current["ml_i"] < len(current["ml_levels"]):
+            next_t = current["ml_levels"][current["ml_i"]]; current["ml_i"] += 1
+            if current["ml_i"] >= 3:
+                print("[ML] ML3 disabled; chain ends at ML2.")
+                current.update({"active":False,"pair":None,"direction":None,"ml_levels":[],
+                                "ml_i":0,"amount":base_amount})
+                return
+            next_amt = round(current["amount"] * mg_mult, 2)
+            current["amount"] = min(next_amt, MAX_STAKE)
+            if current["amount"] < next_amt:
+                print(f"[CAP] ML amount capped to {current['amount']} (MAX_STAKE={MAX_STAKE})")
+            print(f"[ML] LOSS → scheduling ML{current['ml_i']} at {next_t} amount={current['amount']}")
+            task = asyncio.create_task(schedule_entry(next_t))
+            scheduled_tasks.append(task)
+        else:
+            print("[ML] LOSS but no ML levels left. Resetting.")
+            current.update({"active":False,"pair":None,"direction":None,"ml_levels":[],"ml_i":0,"amount":base_amount})
 
 # --- Telegram handlers ---
 async def handle_signal_from_text(text: str, msg_date=None):
     global last_signal_utc, daily_pnl, halted_for_day
     sig = parse_signal(text)
-    if not sig:
-        return False
-    # NEW: stale message guard
+    if not sig: return False
     if msg_date:
         msg_age = (datetime.utcnow() - msg_date.replace(tzinfo=None)).total_seconds()
         if msg_age > 120:
@@ -213,8 +214,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
         handle_signal_from_text._day = et_day_key()
     cur_day = et_day_key()
     if cur_day != handle_signal_from_text._day:
-        daily_pnl = 0.0
-        halted_for_day = False
+        daily_pnl = 0.0; halted_for_day = False
         handle_signal_from_text._day = cur_day
         print(f"[INFO] New ET day {cur_day}: daily PnL reset.")
     if DAILY_STOP_LOSS > 0 and halted_for_day:
@@ -237,8 +237,9 @@ async def handle_signal_from_text(text: str, msg_date=None):
                     "expiry_min": sig["expiry_min"],"ml_levels": sig.get("ml_levels", []),
                     "ml_i": 0,"amount": base_amount})
     last_signal_utc = now_utc
-    print(f"[SIGNAL] {pair} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} | ML {current['ml_levels']}")
-    asyncio.create_task(schedule_entry(sig["entry_time"]))
+    print(f"[SIGNAL] {pair} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} | ML {sig.get('ml_levels', [])}")
+    task = asyncio.create_task(schedule_entry(sig["entry_time"]))
+    scheduled_tasks.append(task)
     return True
 
 async def on_signal(e):
@@ -252,13 +253,11 @@ async def on_signal(e):
     text = (e.message.message or "").strip()
     print("[TG RAW]", text.replace("\n", " | ")[:500])
     ok = await handle_signal_from_text(text, msg_date=e.message.date)
-    if not ok:
-        print("[TG DEBUG] Ignored: no valid signal found")
+    if not ok: print("[TG DEBUG] Ignored: no valid signal found")
 
 async def backfill_latest(entity):
     async for msg in client.iter_messages(entity, limit=20):
-        if not msg.message:
-            continue
+        if not msg.message: continue
         text = msg.message.strip()
         if await handle_signal_from_text(text, msg_date=msg.date):
             break
@@ -281,10 +280,8 @@ async def main():
     print(f"[DEBUG] Listening to: {getattr(entity, 'title', None)} (ID {entity.id})")
     client.add_event_handler(on_signal, events.NewMessage(chats=entity))
     client.add_event_handler(on_signal, events.MessageEdited(chats=entity))
-    print("[DEBUG] Launching PocketOptionExecutor...")
-    await executor.launch(); await executor.login(); await executor.goto_trade()
-    print("[DEBUG] Pocket Option trade screen ready.")
-    if not NO_BACKFILL:
+    print("[DEBUG] Pocket Option trade screen ready (via Node API).")
+    if "--no-backfill" not in sys.argv:
         print("[DEBUG] Backfilling recent messages…")
         await backfill_latest(entity)
     await client.run_until_disconnected()
