@@ -1,4 +1,4 @@
-// po_executor.js — Executor with result logging (wait until expiry)
+// po_executor.js — Executor with corrected result logging
 const path = require("path");
 const express = require("express");
 const { chromium } = require("playwright");
@@ -49,29 +49,25 @@ async function focusTradePanel() {
 }
 
 async function forceCloseOverlays() {
+  // extra guarantee that dropdown closes
   for (let i = 0; i < 3; i++) {
     try { await page.keyboard.press('Escape'); } catch {}
     const overlay = page.locator(SEL.assetOverlay).first();
     const visible = await overlay.isVisible().catch(() => false);
     if (!visible) break;
-    try {
-      await page.locator(SEL.symbolToggle).first().click({ timeout: 800 });
-    } catch {}
+    try { await page.mouse.click(10, 10); } catch {}
     await sleep(120);
   }
 }
 
 async function ensureOnPO() {
   if (!page || page.isClosed()) throw new Error("No page");
-
   const url = page.url() || "";
   if (!url.includes("pocketoption.com")) {
     console.log("[Nav] Navigating to PocketOption trade page…");
     await page.goto(PO_URL_TRADE, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
   }
-  await withRetry(async () => {
-    await waitForTradePanel();
-  }, 2, "wait trade panel");
+  await withRetry(async () => { await waitForTradePanel(); }, 2, "wait trade panel");
 }
 
 async function ensurePageAlive() {
@@ -125,14 +121,12 @@ async function selectPair(pair) {
   await sleep(250);
 
   const listItem = page.locator('.alist__label', { hasText: pair }).first();
-  await withRetry(async () => {
-    await listItem.click({ timeout: DEFAULT_TIMEOUT });
-  }, 2, "select list item");
+  await withRetry(async () => { await listItem.click({ timeout: DEFAULT_TIMEOUT }); }, 2, "select list item");
 
   console.log(`[Step] Selected pair: ${pair}`);
 
-  await toggle.click({ timeout: 800 }).catch(() => {});
-  await page.waitForSelector(SEL.assetOverlay, { state: 'detached', timeout: DEFAULT_TIMEOUT }).catch(() => {});
+  // force-close dropdown
+  await page.keyboard.press('Escape').catch(() => {});
   await forceCloseOverlays();
 }
 
@@ -158,7 +152,6 @@ async function placeTrade(pair, amount, direction) {
   await withRetry(async () => { await setTradeAmount(amount); }, 2, "setTradeAmount");
 
   console.log("[Step] Expiry locked at 5m (no action needed)");
-  await forceCloseOverlays();
 
   const panel = page.locator(SEL.tradePanel).first();
   const btn = direction.toLowerCase() === 'buy'
@@ -170,24 +163,27 @@ async function placeTrade(pair, amount, direction) {
 
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount}`);
 
-  // ✅ Wait 5m + 5s for expiry before scraping Closed tab
+  // ✅ Wait for expiry: 5m + buffer
   await sleep(305000);
 
-  // Switch to Closed tab
+  // Switch to Closed tab and scrape result
   await page.locator(SEL.closedTab).click({ timeout: 5000 }).catch(() => {
     throw new Error("Failed to click Closed tab");
   });
 
-  // Get the first row from Closed trades
   const row = page.locator(SEL.closedRow).first();
   await row.waitFor({ state: "visible", timeout: 10000 });
 
   const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
+  console.log(`[Debug] Closed row text: ${rowText}`);
+
+  // ✅ Extract final profit (last $ value)
   let profit = 0.0, result = "LOSS";
-  const profitMatch = rowText.match(/([+-]?\$[\d.]+)/);
-  if (profitMatch) {
-    profit = parseFloat(profitMatch[1].replace("$", ""));
-    if (profit > 0) result = "WIN";
+  const profitMatches = rowText.match(/\$[0-9.]+/g);
+  if (profitMatches && profitMatches.length > 0) {
+    const lastVal = profitMatches[profitMatches.length - 1];
+    profit = parseFloat(lastVal.replace("$", ""));
+    result = profit > 0 ? "WIN" : "LOSS";
   }
 
   const ts = new Date().toISOString();

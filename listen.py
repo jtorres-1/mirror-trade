@@ -142,7 +142,7 @@ async def run_one_trade(pair: str, direction: str, expiry_min: int, amount: floa
         res = requests.post(
             "http://localhost:3000/trade",
             json={"pair": clean_pair, "amount": amount, "direction": direction.lower()},
-            timeout=60
+            timeout=400
         )
         if res.status_code == 200:
             data = res.json()
@@ -159,11 +159,13 @@ async def run_one_trade(pair: str, direction: str, expiry_min: int, amount: floa
     log_trade(clean_pair, direction, expiry_min, amount, "ERROR", 0.0)
     return False
 
+# --- Fixed ML cancellation logic ---
 async def schedule_entry(entry_time: str):
     global current, scheduled_tasks
     if DAILY_STOP_LOSS > 0 and halted_for_day:
         print("[HALT] Daily stop-loss reached; skip scheduled entry.")
         return
+
     tgt_local = to_next_or_now(entry_time)
     print(f"[TIME] ET {entry_time} -> local {tgt_local.strftime('%Y-%m-%d %H:%M:%S')}  now {datetime.now()}")
     await sleep_until(tgt_local)
@@ -174,31 +176,56 @@ async def schedule_entry(entry_time: str):
     won = await run_one_trade(pair, direction, expiry, amt)
 
     if won:
-        print("[ML] WIN → reset to base amount & cancel ML chain")
+        # ✅ Cancel all ML chain on ANY win (base or ML)
+        print("[ML] WIN → cancelling pending ML tasks and resetting to base")
         for t in scheduled_tasks:
             if not t.done():
                 t.cancel()
         scheduled_tasks.clear()
-        current.update({"active":False,"pair":None,"direction":None,"ml_levels":[],"ml_i":0,"amount":base_amount})
+        current.update({
+            "active": False,
+            "pair": None,
+            "direction": None,
+            "ml_levels": [],
+            "ml_i": 0,
+            "amount": base_amount
+        })
         return
+
+    # LOSS case
+    if current["ml_i"] < len(current["ml_levels"]):
+        next_t = current["ml_levels"][current["ml_i"]]
+        current["ml_i"] += 1
+        if current["ml_i"] >= 3:
+            print("[ML] ML3 disabled; chain ends at ML2.")
+            current.update({
+                "active": False,
+                "pair": None,
+                "direction": None,
+                "ml_levels": [],
+                "ml_i": 0,
+                "amount": base_amount
+            })
+            return
+
+        next_amt = round(current["amount"] * mg_mult, 2)
+        current["amount"] = min(next_amt, MAX_STAKE)
+        if current["amount"] < next_amt:
+            print(f"[CAP] ML amount capped to {current['amount']} (MAX_STAKE={MAX_STAKE})")
+
+        print(f"[ML] LOSS → scheduling ML{current['ml_i']} at {next_t} amount={current['amount']}")
+        task = asyncio.create_task(schedule_entry(next_t))
+        scheduled_tasks.append(task)
     else:
-        if current["ml_i"] < len(current["ml_levels"]):
-            next_t = current["ml_levels"][current["ml_i"]]; current["ml_i"] += 1
-            if current["ml_i"] >= 3:
-                print("[ML] ML3 disabled; chain ends at ML2.")
-                current.update({"active":False,"pair":None,"direction":None,"ml_levels":[],
-                                "ml_i":0,"amount":base_amount})
-                return
-            next_amt = round(current["amount"] * mg_mult, 2)
-            current["amount"] = min(next_amt, MAX_STAKE)
-            if current["amount"] < next_amt:
-                print(f"[CAP] ML amount capped to {current['amount']} (MAX_STAKE={MAX_STAKE})")
-            print(f"[ML] LOSS → scheduling ML{current['ml_i']} at {next_t} amount={current['amount']}")
-            task = asyncio.create_task(schedule_entry(next_t))
-            scheduled_tasks.append(task)
-        else:
-            print("[ML] LOSS but no ML levels left. Resetting.")
-            current.update({"active":False,"pair":None,"direction":None,"ml_levels":[],"ml_i":0,"amount":base_amount})
+        print("[ML] LOSS but no ML levels left. Resetting.")
+        current.update({
+            "active": False,
+            "pair": None,
+            "direction": None,
+            "ml_levels": [],
+            "ml_i": 0,
+            "amount": base_amount
+        })
 
 # --- Telegram handlers ---
 async def handle_signal_from_text(text: str, msg_date=None):
