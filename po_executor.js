@@ -1,4 +1,6 @@
-// po_executor.js — Executor with corrected result logging
+// po_executor.js — Hardened executor
+// Fix: Scoped selectors, single-click guard, pair-switch delay, ML tag logging
+
 const path = require("path");
 const express = require("express");
 const { chromium } = require("playwright");
@@ -13,15 +15,17 @@ const LOG_FILE = path.resolve(__dirname, "trade_log.csv");
 const SEL = {
   symbolToggle: 'span.current-symbol.current-symbol_cropped, .current-symbol',
   assetOverlay: '.drop-down-modal-wrap.active',
-  tradePanel: '#put-call-buttons-chart-1, .put-call-buttons',
+  tradePanel: '[id^="put-call-buttons-chart"]',   // any chart panel
   searchInput: 'input[placeholder="Search"]',
-  buyBtn: 'a:has-text("Buy"), a.buy, button:has-text("Buy")',
-  sellBtn: 'a:has-text("Sell"), a.sell, button:has-text("Sell")',
+  buyBtn: 'a.btn.btn-call',
+  sellBtn: 'a.btn.btn-put',
   closedTab: 'li:has-text("Closed")',
   closedRow: '.deals-list__item'
 };
 
+
 let context, page;
+let tradeInProgress = false; // ✅ Guard flag
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ----------------------------- Utilities ------------------------------------
@@ -42,14 +46,7 @@ async function waitForTradePanel() {
   await page.waitForSelector(SEL.tradePanel, { timeout: DEFAULT_TIMEOUT });
 }
 
-async function focusTradePanel() {
-  const panel = page.locator(SEL.tradePanel).first();
-  await panel.waitFor({ state: "visible", timeout: DEFAULT_TIMEOUT });
-  await panel.click({ timeout: DEFAULT_TIMEOUT }).catch(() => {});
-}
-
 async function forceCloseOverlays() {
-  // extra guarantee that dropdown closes
   for (let i = 0; i < 3; i++) {
     try { await page.keyboard.press('Escape'); } catch {}
     const overlay = page.locator(SEL.assetOverlay).first();
@@ -87,7 +84,6 @@ async function ensurePageAlive() {
 async function setTradeAmount(amount) {
   const panel = page.locator(SEL.tradePanel).first();
   const amountBox = panel.getByRole('textbox').first();
-
   await amountBox.waitFor({ state: 'attached', timeout: DEFAULT_TIMEOUT }).catch(() => {});
   try {
     await amountBox.fill(String(amount), { force: true, timeout: 1500 });
@@ -124,27 +120,33 @@ async function selectPair(pair) {
   await withRetry(async () => { await listItem.click({ timeout: DEFAULT_TIMEOUT }); }, 2, "select list item");
 
   console.log(`[Step] Selected pair: ${pair}`);
-
-  // force-close dropdown
   await page.keyboard.press('Escape').catch(() => {});
   await forceCloseOverlays();
+
+  // ✅ Safety delay: let chart + trade panel refresh
+  await sleep(1500);
 }
 
 // ----------------------------- Logging helper --------------------------------
-function appendLog(ts, pair, dir, amount, result, profit) {
+function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "") {
+  const header = "Time,Pair,Dir,Amount,Result,Profit,ML_Tag\n";
   if (!fs.existsSync(LOG_FILE)) {
-    fs.writeFileSync(LOG_FILE, "Time,Pair,Dir,Amount,Result,Profit\n");
+    fs.writeFileSync(LOG_FILE, header);
   }
-  fs.appendFileSync(LOG_FILE, `${ts},${pair},${dir},${amount},${result},${profit}\n`);
+  fs.appendFileSync(LOG_FILE, `${ts},${pair},${dir},${amount},${result},${profit},${ml_tag}\n`);
 }
 
 // ----------------------------- Trade Exec -----------------------------------
-async function placeTrade(pair, amount, direction) {
-  console.log(`[Step] Trade request: ${direction.toUpperCase()} ${pair} $${amount}`);
+async function placeTrade(pair, amount, direction, ml_tag = "") {
+  if (tradeInProgress) {
+    console.warn("[Guard] Trade already in progress. Skipping duplicate request.");
+    return { success: false, result: "SKIPPED", profit: 0, ml_tag };
+  }
+  tradeInProgress = true;
 
+  console.log(`[Step] Trade request: ${direction.toUpperCase()} ${pair} $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
   await ensurePageAlive();
   await ensureOnPO();
-  await focusTradePanel();
 
   await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
 
@@ -159,14 +161,22 @@ async function placeTrade(pair, amount, direction) {
     : panel.locator(SEL.sellBtn).first();
 
   await btn.waitFor({ state: 'visible', timeout: DEFAULT_TIMEOUT });
-  await withRetry(async () => { await btn.click({ timeout: DEFAULT_TIMEOUT }); }, 2, "click buy/sell");
 
-  console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount}`);
+  console.log(`[CLICK] ${direction.toUpperCase()} button for ${pair} @ $${amount}`);
 
-  // ✅ Wait for expiry: 5m + buffer
+  try {
+    await btn.click({ timeout: DEFAULT_TIMEOUT });
+  } catch (err) {
+    console.error("[❌] Trade button click failed:", err);
+    tradeInProgress = false;
+    throw err;
+  }
+
+  console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
+
+  // ✅ Wait expiry to read result
   await sleep(305000);
 
-  // Switch to Closed tab and scrape result
   await page.locator(SEL.closedTab).click({ timeout: 5000 }).catch(() => {
     throw new Error("Failed to click Closed tab");
   });
@@ -177,7 +187,6 @@ async function placeTrade(pair, amount, direction) {
   const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
   console.log(`[Debug] Closed row text: ${rowText}`);
 
-  // ✅ Extract final profit (last $ value)
   let profit = 0.0, result = "LOSS";
   const profitMatches = rowText.match(/\$[0-9.]+/g);
   if (profitMatches && profitMatches.length > 0) {
@@ -187,10 +196,12 @@ async function placeTrade(pair, amount, direction) {
   }
 
   const ts = new Date().toISOString();
-  appendLog(ts, pair, direction, amount, result, profit);
+  appendLog(ts, pair, direction, amount, result, profit, ml_tag);
 
-  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit}`);
-  return { success: true, result, profit };
+  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""}`);
+
+  tradeInProgress = false;
+  return { success: true, result, profit, ml_tag };
 }
 
 // ----------------------------- Browser Init ---------------------------------
@@ -224,13 +235,13 @@ app.use(express.json());
 
 app.post("/trade", async (req, res) => {
   console.log("[REQ] Incoming trade request:", req.body);
-  const { pair, amount, direction } = req.body || {};
+  const { pair, amount, direction, ml_tag } = req.body || {};
   if (!pair || !amount || !direction) {
     console.error("[❌] Missing required fields:", req.body);
     return res.status(400).json({ success: false, error: "pair, amount, direction required" });
   }
   try {
-    const result = await placeTrade(pair, amount, direction);
+    const result = await placeTrade(pair, amount, direction, ml_tag);
     res.json({ success: true, pair, amount, direction, ...result });
   } catch (err) {
     console.error("[❌] Trade failed:", err);
@@ -249,10 +260,5 @@ process.on("SIGINT", async () => {
   try { await context?.close(); } catch {}
   process.exit(0);
 });
-
-process.on("unhandledRejection", (err) => {
-  console.error("[UnhandledRejection]", err);
-});
-process.on("uncaughtException", (err) => {
-  console.error("[UncaughtException]", err);
-});
+process.on("unhandledRejection", (err) => console.error("[UnhandledRejection]", err));
+process.on("uncaughtException", (err) => console.error("[UncaughtException]", err));

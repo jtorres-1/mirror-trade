@@ -1,0 +1,13 @@
+2025/08/31-23:04:41.218 2338cd Reusing MANIFEST /Users/j1/mirrortrade/po_profile/Default/IndexedDB/https_pocketoption.com_0.indexeddb.leveldb/MANIFEST-000001
+2025/08/31-23:04:41.218 2338cd Recovering log #122
+2025/08/31-23:04:41.218 2338cd Reusing old log /Users/j1/mirrortrade/po_profile/Default/IndexedDB/https_pocketoption.com_0.indexeddb.leveldb/000122.log 
+2025/08/31-23:04:41.266 2338bc Level-0 table #127: started
+2025/08/31-23:04:41.267 2338bc Level-0 table #127: 2054 bytes OK
+2025/08/31-23:04:41.268 2338bc Delete type=0 #122
+2025/08/31-23:04:41.268 2338bc Manual compaction at level-0 from '\x00&\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00'\x00\x00\x00' @ 0 : 0; will stop at '\x00&\x00\x00\x05' @ 1799 : 1
+2025/08/31-23:04:41.268 2338bc Compacting 1@0 + 1@1 files
+2025/08/31-23:04:41.269 2338bc Generated table #128@0: 43 keys, 1592 bytes
+2025/08/31-23:04:41.269 2338bc Compacted 1@0 + 1@1 files => 1592 bytes
+2025/08/31-23:04:41.270 2338bc compacted to: files[ 0 1 1 0 0 0 0 ]
+2025/08/31-23:04:41.270 2338bc Delete type=2 #127
+2025/08/31-23:04:41.271 2338bc Manual compaction at level-0 from '\x00&\x00\x00\x05' @ 1799 : 1 .. '\x00'\x00\x00\x00' @ 0 : 0; will stop at (end)
