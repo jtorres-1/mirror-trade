@@ -12,6 +12,9 @@ const HEADLESS = process.env.HEADLESS === "1";
 const DEFAULT_TIMEOUT = 60_000;
 const LOG_FILE = path.resolve(__dirname, "trade_log.csv");
 
+const SCREEN_DIR = path.resolve(__dirname, "screens");
+if (!fs.existsSync(SCREEN_DIR)) fs.mkdirSync(SCREEN_DIR);
+
 const SEL = {
   symbolToggle: 'span.current-symbol.current-symbol_cropped, .current-symbol',
   assetOverlay: '.drop-down-modal-wrap.active',
@@ -25,8 +28,6 @@ const SEL = {
   closedTab: 'li:has-text("Closed")',
   closedRow: '.deals-list__item'
 };
-
-
 
 let context, page;
 let tradeInProgress = false; // ✅ Guard flag
@@ -47,7 +48,16 @@ async function withRetry(fn, attempts = 2, label = "op") {
 }
 
 async function waitForTradePanel() {
-  await page.waitForSelector(SEL.tradePanel, { timeout: DEFAULT_TIMEOUT });
+  try {
+    await page.waitForSelector(SEL.tradePanel, { timeout: DEFAULT_TIMEOUT });
+    console.log("[✅] Trade panel detected");
+  } catch (err) {
+    console.error("[❌] Trade panel NOT found:", err.message);
+    const file = path.join(SCREEN_DIR, `no_tradepanel_${Date.now()}.png`);
+    await page.screenshot({ path: file }).catch(() => {});
+    console.log("[📸] Screenshot saved:", file);
+    throw err;
+  }
 }
 
 async function forceCloseOverlays() {
@@ -67,6 +77,9 @@ async function ensureOnPO() {
   if (!url.includes("pocketoption.com")) {
     console.log("[Nav] Navigating to PocketOption trade page…");
     await page.goto(PO_URL_TRADE, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
+    const file = path.join(SCREEN_DIR, `navigated_${Date.now()}.png`);
+    await page.screenshot({ path: file }).catch(() => {});
+    console.log("[📸] Screenshot after navigation saved:", file);
   }
   await withRetry(async () => { await waitForTradePanel(); }, 2, "wait trade panel");
 }
@@ -230,6 +243,9 @@ async function initBrowser() {
 
   await page.goto(PO_URL_TRADE, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
   await ensureOnPO();
+  const file = path.join(SCREEN_DIR, `init_ready_${Date.now()}.png`);
+  await page.screenshot({ path: file }).catch(() => {});
+  console.log("[📸] Screenshot after init saved:", file);
   console.log("[Init] PocketOption ready.");
 }
 
