@@ -15,13 +15,17 @@ const LOG_FILE = path.resolve(__dirname, "trade_log.csv");
 const SEL = {
   symbolToggle: 'span.current-symbol.current-symbol_cropped, .current-symbol',
   assetOverlay: '.drop-down-modal-wrap.active',
-  tradePanel: '[id^="put-call-buttons-chart"]',   // any chart panel
+  tradePanel: '[id^="put-call-buttons-chart"]', // panel container
   searchInput: 'input[placeholder="Search"]',
-  buyBtn: 'a.btn.btn-call',
-  sellBtn: 'a.btn.btn-put',
+
+  // ✅ More robust Buy/Sell selectors
+  buyBtn: '#put-call-buttons-chart-1 a.buy, #put-call-buttons-chart-1 button:has-text("Buy"), a.btn.btn-call',
+  sellBtn: '#put-call-buttons-chart-1 a.sell, #put-call-buttons-chart-1 button:has-text("Sell"), a.btn.btn-put',
+
   closedTab: 'li:has-text("Closed")',
   closedRow: '.deals-list__item'
 };
+
 
 
 let context, page;
