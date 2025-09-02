@@ -7,7 +7,6 @@ const { chromium } = require("playwright");
 const fs = require("fs");
 
 const PO_URL_TRADE = "https://pocketoption.com/en/cabinet/";
-const USER_DATA_DIR = path.resolve(__dirname, "po_profile");
 const HEADLESS = process.env.HEADLESS === "1";
 const DEFAULT_TIMEOUT = 60_000;
 const LOG_FILE = path.resolve(__dirname, "trade_log.csv");
@@ -18,10 +17,9 @@ if (!fs.existsSync(SCREEN_DIR)) fs.mkdirSync(SCREEN_DIR);
 const SEL = {
   symbolToggle: 'span.current-symbol.current-symbol_cropped, .current-symbol',
   assetOverlay: '.drop-down-modal-wrap.active',
-  tradePanel: '[id^="put-call-buttons-chart"]', // panel container
+  tradePanel: '[id^="put-call-buttons-chart"]',
   searchInput: 'input[placeholder="Search"]',
 
-  // ✅ More robust Buy/Sell selectors
   buyBtn: '#put-call-buttons-chart-1 a.buy, #put-call-buttons-chart-1 button:has-text("Buy"), a.btn.btn-call',
   sellBtn: '#put-call-buttons-chart-1 a.sell, #put-call-buttons-chart-1 button:has-text("Sell"), a.btn.btn-put',
 
@@ -30,7 +28,7 @@ const SEL = {
 };
 
 let context, page;
-let tradeInProgress = false; // ✅ Guard flag
+let tradeInProgress = false;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ----------------------------- Utilities ------------------------------------
@@ -61,7 +59,7 @@ async function waitForTradePanel() {
 }
 
 async function forceCloseOverlays() {
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; < 3; i++) {
     try { await page.keyboard.press('Escape'); } catch {}
     const overlay = page.locator(SEL.assetOverlay).first();
     const visible = await overlay.isVisible().catch(() => false);
@@ -140,11 +138,9 @@ async function selectPair(pair) {
   await page.keyboard.press('Escape').catch(() => {});
   await forceCloseOverlays();
 
-  // ✅ Safety delay: let chart + trade panel refresh
   await sleep(1500);
 }
 
-// ----------------------------- Logging helper --------------------------------
 function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "") {
   const header = "Time,Pair,Dir,Amount,Result,Profit,ML_Tag\n";
   if (!fs.existsSync(LOG_FILE)) {
@@ -153,7 +149,6 @@ function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "") {
   fs.appendFileSync(LOG_FILE, `${ts},${pair},${dir},${amount},${result},${profit},${ml_tag}\n`);
 }
 
-// ----------------------------- Trade Exec -----------------------------------
 async function placeTrade(pair, amount, direction, ml_tag = "") {
   if (tradeInProgress) {
     console.warn("[Guard] Trade already in progress. Skipping duplicate request.");
@@ -191,7 +186,6 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
 
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
 
-  // ✅ Wait expiry to read result
   await sleep(305000);
 
   await page.locator(SEL.closedTab).click({ timeout: 5000 }).catch(() => {
@@ -223,23 +217,11 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
 
 // ----------------------------- Browser Init ---------------------------------
 async function initBrowser() {
-  console.log("[Init] Launching PocketOption persistent session…");
-  context = await chromium.launchPersistentContext(
-    "/root/mirror-trade/po_profile",
-    {
-      headless: HEADLESS,
-      viewport: null,
-      args: [
-        "--start-maximized",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled"
-      ],
-    }
-  );
-  
+  console.log("[Init] Launching PocketOption with saved storage state…");
+  const browser = await chromium.launch({ headless: HEADLESS, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+  context = await browser.newContext({ storageState: "po_storage.json" });
 
-  page = context.pages()[0] || await context.newPage();
+  page = await context.newPage();
   page.setDefaultTimeout(DEFAULT_TIMEOUT);
 
   page.on("close", () => console.warn("[Warn] Page closed event detected."));
@@ -278,7 +260,6 @@ app.listen(3000, async () => {
   console.log("[Server] Executor API listening on http://localhost:3000");
 });
 
-// Graceful shutdown
 process.on("SIGINT", async () => {
   console.log("[Shutdown] Closing context…");
   try { await context?.close(); } catch {}
