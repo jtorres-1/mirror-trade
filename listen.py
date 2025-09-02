@@ -4,14 +4,11 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError
 
 load_dotenv()
 
 # --- Env ---
-api_id = int(os.getenv("API_ID"))
-api_hash = os.getenv("API_HASH")
-phone = os.getenv("PHONE_NUMBER")
+bot_token = os.getenv("BOT_TOKEN")
 session_name = os.getenv("SESSION_NAME", "mirrortrade")
 channel = os.getenv("CHANNEL")
 
@@ -25,7 +22,8 @@ DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
 if channel and not channel.startswith("@"):
     channel = "@" + channel
 
-client = TelegramClient(session_name, api_id, api_hash)
+# --- Initialize Telegram client with bot token ---
+client = TelegramClient(session_name, api_id=0, api_hash="").start(bot_token=bot_token)
 
 # --- Logging ---
 LOG_FILE = "trade_log.csv"
@@ -277,23 +275,13 @@ async def on_signal(e):
 
 # --- Main ---
 async def main():
-    print("[DEBUG] Starting Telegram client...")
-    await client.connect()
-    if not await client.is_user_authorized():
-        await client.send_code_request(phone)
-        code = input("Enter the Telegram code: ").strip()
-        try:
-            await client.sign_in(phone, code)
-        except SessionPasswordNeededError:
-            pw = input("Enter your Telegram 2FA password: ").strip()
-            await client.sign_in(password=pw)
+    print("[DEBUG] Bot client starting...")
     me = await client.get_me()
-    print(f"[DEBUG] Logged in as: {me.username or me.first_name} (ID {me.id})")
+    print(f"[DEBUG] Bot logged in as: {me.username} (ID {me.id})")
     entity = await client.get_entity(channel)
     print(f"[DEBUG] Listening to: {getattr(entity, 'title', None)} (ID {entity.id})")
-    client.add_event_handler(on_signal, events.NewMessage(chats=entity))  # ✅ only NEW messages now
+    client.add_event_handler(on_signal, events.NewMessage(chats=entity))
     print("[DEBUG] Pocket Option trade screen ready (via Node API).")
-    # ❌ backfill removed to avoid duplicates
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
