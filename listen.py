@@ -10,7 +10,7 @@ load_dotenv()
 # --- Env ---
 api_id = int(os.getenv("API_ID", "0"))
 api_hash = os.getenv("API_HASH", "")
-bot_token = os.getenv("BOT_TOKEN")
+bot_token = os.getenv("BOT_TOKEN", "")
 session_name = os.getenv("SESSION_NAME", "mirrortrade")
 channel = os.getenv("CHANNEL")
 
@@ -24,7 +24,7 @@ DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
 if channel and not channel.startswith("@"):
     channel = "@" + channel
 
-# --- Initialize Telegram client with app credentials + bot token ---
+# --- Initialize Telegram client (app credentials + bot token) ---
 client = TelegramClient(session_name, api_id, api_hash).start(bot_token=bot_token)
 
 # --- Logging ---
