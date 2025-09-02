@@ -224,16 +224,20 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
 // ----------------------------- Browser Init ---------------------------------
 async function initBrowser() {
   console.log("[Init] Launching PocketOption persistent session…");
-  context = await chromium.launchPersistentContext(USER_DATA_DIR, {
-    headless: HEADLESS,
-    viewport: null,
-    args: [
-      "--start-maximized",
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-blink-features=AutomationControlled"
-    ]
-  });
+  context = await chromium.launchPersistentContext(
+    "/root/mirror-trade/po_profile",
+    {
+      headless: HEADLESS,
+      viewport: null,
+      args: [
+        "--start-maximized",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled"
+      ],
+    }
+  );
+  
 
   page = context.pages()[0] || await context.newPage();
   page.setDefaultTimeout(DEFAULT_TIMEOUT);
