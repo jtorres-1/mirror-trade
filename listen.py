@@ -8,6 +8,8 @@ from telethon import TelegramClient, events
 load_dotenv()
 
 # --- Env ---
+api_id = int(os.getenv("API_ID", "0"))
+api_hash = os.getenv("API_HASH", "")
 bot_token = os.getenv("BOT_TOKEN")
 session_name = os.getenv("SESSION_NAME", "mirrortrade")
 channel = os.getenv("CHANNEL")
@@ -22,8 +24,8 @@ DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
 if channel and not channel.startswith("@"):
     channel = "@" + channel
 
-# --- Initialize Telegram client with bot token ---
-client = TelegramClient(session_name, api_id=0, api_hash="").start(bot_token=bot_token)
+# --- Initialize Telegram client with app credentials + bot token ---
+client = TelegramClient(session_name, api_id, api_hash).start(bot_token=bot_token)
 
 # --- Logging ---
 LOG_FILE = "trade_log.csv"
@@ -277,7 +279,7 @@ async def on_signal(e):
 async def main():
     print("[DEBUG] Bot client starting...")
     me = await client.get_me()
-    print(f"[DEBUG] Bot logged in as: {me.username} (ID {me.id})")
+    print(f"[DEBUG] Bot logged in as: {me.username or me.first_name} (ID {me.id})")
     entity = await client.get_entity(channel)
     print(f"[DEBUG] Listening to: {getattr(entity, 'title', None)} (ID {entity.id})")
     client.add_event_handler(on_signal, events.NewMessage(chats=entity))
