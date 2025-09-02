@@ -4,13 +4,14 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError
 
 load_dotenv()
 
 # --- Env ---
 api_id = int(os.getenv("API_ID", "0"))
 api_hash = os.getenv("API_HASH", "")
-bot_token = os.getenv("BOT_TOKEN", "")
+phone = os.getenv("PHONE_NUMBER")
 session_name = os.getenv("SESSION_NAME", "mirrortrade")
 channel = os.getenv("CHANNEL")
 
@@ -21,11 +22,19 @@ mg_mult = float(os.getenv("MARTINGALE_MULT", "2.2"))
 MAX_STAKE = float(os.getenv("MAX_STAKE", "10.65"))
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
 
+if not api_id or not api_hash:
+    print("[FATAL] API_ID/API_HASH missing in .env")
+    sys.exit(1)
+
+if not channel:
+    print("[FATAL] CHANNEL missing in .env")
+    sys.exit(1)
+
 if channel and not channel.startswith("@"):
     channel = "@" + channel
 
-# --- Initialize Telegram client (app credentials + bot token) ---
-client = TelegramClient(session_name, api_id, api_hash).start(bot_token=bot_token)
+# --- Initialize Telegram client (user session; no bot token) ---
+client = TelegramClient(session_name, api_id, api_hash)
 
 # --- Logging ---
 LOG_FILE = "trade_log.csv"
@@ -277,9 +286,19 @@ async def on_signal(e):
 
 # --- Main ---
 async def main():
-    print("[DEBUG] Bot client starting...")
+    print("[DEBUG] Starting Telegram client...")
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.send_code_request(phone)
+        code = input("Enter the Telegram code: ").strip()
+        try:
+            await client.sign_in(phone, code)
+        except SessionPasswordNeededError:
+            pw = input("Enter your Telegram 2FA password: ").strip()
+            await client.sign_in(password=pw)
+
     me = await client.get_me()
-    print(f"[DEBUG] Bot logged in as: {me.username or me.first_name} (ID {me.id})")
+    print(f"[DEBUG] Logged in as: {me.username or me.first_name} (ID {me.id})")
     entity = await client.get_entity(channel)
     print(f"[DEBUG] Listening to: {getattr(entity, 'title', None)} (ID {entity.id})")
     client.add_event_handler(on_signal, events.NewMessage(chats=entity))
