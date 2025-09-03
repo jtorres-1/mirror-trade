@@ -73,26 +73,47 @@ def parse_signal(text: str) -> Optional[Dict]:
     if looks_like_summary(norm):
         return None
     d = {"pair": None, "direction": None, "expiry_min": None, "entry_time": None, "ml_levels": []}
+
+    # Pair
     m_pair = PAIR_RE.search(norm.upper())
-    if m_pair: d["pair"] = d.get("pair") or m_pair.group(1)
+    if m_pair:
+        d["pair"] = m_pair.group(1)
+
+    # Split lines
     lines = [ln.strip() for ln in norm.splitlines() if ln.strip()]
     for ln in lines:
         up = ln.upper()
-        if "BUY" in up: d["direction"] = "BUY"
-        if "SELL" in up: d["direction"] = "SELL"
+
+        if "BUY" in up:
+            d["direction"] = "BUY"
+        if "SELL" in up:
+            d["direction"] = "SELL"
+
         if "EXPIRATION" in up:
             m = MIN_RE.search(up)
-            if m: d["expiry_min"] = int(m.group(1))
+            if m:
+                d["expiry_min"] = int(m.group(1))
+
         if "ENTRY" in up:
             m = TIME_RE.search(ln)
-            if m: d["entry_time"] = m.group(1)
+            if m:
+                d["entry_time"] = m.group(1)
+
         if "LEVEL" in up:
-            m = TIME_RE.search(ln)
-            if m: d["ml_levels"].append(m.group(1))
+            times = TIME_RE.findall(ln)
+            for t in times:
+                if t != d["entry_time"]:  # don’t duplicate entry
+                    d["ml_levels"].append(t)
+
+    # Fallbacks
     if d["entry_time"] is None:
         times = TIME_RE.findall(norm)
-        if times: d["entry_time"] = times[0]
-    if d["expiry_min"] is None: d["expiry_min"] = 5
+        if times:
+            d["entry_time"] = times[0]
+
+    if d["expiry_min"] is None:
+        d["expiry_min"] = 5
+
     if d["pair"] and d["direction"] and d["entry_time"]:
         return d
     return None
