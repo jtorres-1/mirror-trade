@@ -18,7 +18,7 @@ phone = os.getenv("PHONE_NUMBER")
 session_name = os.getenv("SESSION_NAME", "mirrortrade")
 channel = os.getenv("CHANNEL")
 
-tz_offset_minutes = int(os.getenv("TZ_OFFSET_MIN", "240"))  # ET offset vs UTC (LA uses 240)
+tz_offset_minutes = -int(os.getenv("TZ_OFFSET_MIN", "240"))  # ET offset vs UTC (LA uses 240)
 FORCE_OTC = os.getenv("FORCE_OTC", "1") == "1"
 base_amount = float(os.getenv("TRADE_AMOUNT", "1"))
 mg_mult = float(os.getenv("MARTINGALE_MULT", "2.2"))
