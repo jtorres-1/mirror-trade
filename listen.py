@@ -5,6 +5,7 @@ from typing import Optional, Dict
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
+import emoji  # <-- added
 
 load_dotenv()
 
@@ -60,8 +61,15 @@ def looks_like_summary(text: str) -> bool:
     up = text.upper()
     return any(m in up for m in SUMMARY_MARKERS)
 
+def normalize_signal_text(text: str) -> str:
+    text = text.replace('\u200b',' ')
+    text = text.replace("|", "\n")               # turn pipes into newlines
+    text = emoji.replace_emoji(text, replace="") # strip emojis
+    text = re.sub(r"\s+", " ", text)             # collapse multiple spaces
+    return text.strip()
+
 def parse_signal(text: str) -> Optional[Dict]:
-    norm = text.replace('\u200b',' ')
+    norm = normalize_signal_text(text)
     if looks_like_summary(norm):
         return None
     d = {"pair": None, "direction": None, "expiry_min": None, "entry_time": None, "ml_levels": []}
@@ -70,10 +78,8 @@ def parse_signal(text: str) -> Optional[Dict]:
     lines = [ln.strip() for ln in norm.splitlines() if ln.strip()]
     for ln in lines:
         up = ln.upper()
-        if " BUY" in f" {up} " or up.endswith("BUY") or up.startswith("BUY"):
-            d["direction"] = "BUY"
-        if " SELL" in f" {up} " or up.endswith("SELL") or up.startswith("SELL"):
-            d["direction"] = "SELL"
+        if "BUY" in up: d["direction"] = "BUY"
+        if "SELL" in up: d["direction"] = "SELL"
         if "EXPIRATION" in up:
             m = MIN_RE.search(up)
             if m: d["expiry_min"] = int(m.group(1))
