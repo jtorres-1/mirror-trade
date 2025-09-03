@@ -5,7 +5,7 @@ from typing import Optional, Dict
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
-import emoji  # <-- added
+import emoji
 
 load_dotenv()
 
@@ -16,7 +16,7 @@ phone = os.getenv("PHONE_NUMBER")
 session_name = os.getenv("SESSION_NAME", "mirrortrade")
 channel = os.getenv("CHANNEL")
 
-tz_offset_minutes = abs(int(os.getenv("TZ_OFFSET_MIN", "180")))
+tz_offset_minutes = int(os.getenv("TZ_OFFSET_MIN", "-240"))  # ET offset vs UTC (default: UTC-4)
 FORCE_OTC = os.getenv("FORCE_OTC", "1") == "1"
 base_amount = float(os.getenv("TRADE_AMOUNT", "1"))
 mg_mult = float(os.getenv("MARTINGALE_MULT", "2.2"))
@@ -64,7 +64,7 @@ def looks_like_summary(text: str) -> bool:
 def normalize_signal_text(text: str) -> str:
     text = text.replace('\u200b',' ')
     text = text.replace("|", "\n")
-    text = emoji.replace_emoji(text, replace="") 
+    text = emoji.replace_emoji(text, replace="")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -74,31 +74,45 @@ def parse_signal(text: str) -> Optional[Dict]:
         return None
     d = {"pair": None, "direction": None, "expiry_min": None, "entry_time": None, "ml_levels": []}
 
+    # Pair
     m_pair = PAIR_RE.search(norm.upper())
     if m_pair:
         d["pair"] = m_pair.group(1)
 
+    # Split lines
     lines = [ln.strip() for ln in norm.splitlines() if ln.strip()]
     for ln in lines:
         up = ln.upper()
-        if "BUY" in up: d["direction"] = "BUY"
-        if "SELL" in up: d["direction"] = "SELL"
+
+        if "BUY" in up:
+            d["direction"] = "BUY"
+        if "SELL" in up:
+            d["direction"] = "SELL"
+
         if "EXPIRATION" in up:
             m = MIN_RE.search(up)
-            if m: d["expiry_min"] = int(m.group(1))
+            if m:
+                d["expiry_min"] = int(m.group(1))
+
         if "ENTRY" in up:
             m = TIME_RE.search(ln)
-            if m: d["entry_time"] = m.group(1)
+            if m:
+                d["entry_time"] = m.group(1)
+
         if "LEVEL" in up:
             times = TIME_RE.findall(ln)
             for t in times:
                 if t != d["entry_time"]:
                     d["ml_levels"].append(t)
 
+    # Fallbacks
     if d["entry_time"] is None:
         times = TIME_RE.findall(norm)
-        if times: d["entry_time"] = times[0]
-    if d["expiry_min"] is None: d["expiry_min"] = 5
+        if times:
+            d["entry_time"] = times[0]
+
+    if d["expiry_min"] is None:
+        d["expiry_min"] = 5
 
     if d["pair"] and d["direction"] and d["entry_time"]:
         return d
@@ -106,34 +120,35 @@ def parse_signal(text: str) -> Optional[Dict]:
 
 # --- Time handling ---
 def entry_local_from_et(hhmm: str) -> datetime:
+    """Convert ET hh:mm → local VPS datetime"""
     hh, mm = map(int, hhmm.split(":"))
-    now_local = datetime.now()
-    now_et = now_local + timedelta(minutes=tz_offset_minutes)
-    entry_et_today = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    return entry_et_today - timedelta(minutes=tz_offset_minutes)
+    now_utc = datetime.utcnow()
+    # Treat signal time as ET
+    et_today = now_utc + timedelta(minutes=tz_offset_minutes)
+    entry_et = et_today.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    # Convert back to UTC (VPS local time)
+    return entry_et - timedelta(minutes=tz_offset_minutes)
 
 def to_next_or_now(hhmm: str) -> datetime:
-    now = datetime.now()
+    now = datetime.utcnow()
     tgt = entry_local_from_et(hhmm)
-    diff = (tgt - now).total_seconds()
-    if -300 <= diff <= 300:  # allow ±5 min window
+    age_sec = (now - tgt).total_seconds()
+    if -300 <= age_sec <= 300:  # within ±5m → now
         return now
-    if diff < -300:
+    if age_sec > 300:  # if already past, roll to next day
         tgt += timedelta(days=1)
     return tgt
 
 def entry_still_relevant(hhmm: str) -> bool:
-    now = datetime.now()
+    now = datetime.utcnow()
     tgt = entry_local_from_et(hhmm)
-    diff = (tgt - now).total_seconds()
-    # Accept if signal is within 5m past or up to 10m future
-    if -300 <= diff <= 600:
-        return True
-    return False
+    age_sec = (now - tgt).total_seconds()
+    # Accept if not more than 5m old and not further than 12h away
+    return -300 <= age_sec <= 12*3600
 
 def et_day_key() -> str:
-    now_local = datetime.now()
-    now_et = now_local + timedelta(minutes=tz_offset_minutes)
+    now_utc = datetime.utcnow()
+    now_et = now_utc + timedelta(minutes=tz_offset_minutes)
     return now_et.strftime("%Y-%m-%d")
 
 # --- Trade state ---
@@ -148,21 +163,25 @@ halted_for_day = False
 executor_busy = False
 
 async def sleep_until(when: datetime):
-    delay = max(0, (when - datetime.now()).total_seconds())
+    delay = max(0, (when - datetime.utcnow()).total_seconds())
     await asyncio.sleep(delay)
 
 # --- Run one trade via Node executor ---
 async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> bool:
     global executor_busy, daily_pnl, halted_for_day
+
     if executor_busy:
         print("[BLOCK] Executor busy, skipping duplicate call.")
         return False
     executor_busy = True
+
     clean_pair = pair
     if FORCE_OTC and "OTC" not in clean_pair.upper():
         clean_pair = f"{clean_pair} OTC"
+
     ml_tag = f"ML{ml_label}" if ml_label else "BASE"
     success, result, profit = False, "ERROR", 0.0
+
     try:
         res = requests.post(
             "http://localhost:3000/trade",
@@ -181,11 +200,13 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> b
         print(f"[API EXCEPTION] {e}")
     finally:
         executor_busy = False
+
     log_trade(clean_pair, direction, expiry_min, amount, result, profit, ml_tag)
     daily_pnl += profit
     if DAILY_STOP_LOSS > 0 and daily_pnl <= -DAILY_STOP_LOSS:
         halted_for_day = True
         print(f"[HALT] Daily stop-loss reached. PnL={daily_pnl:.2f}, halting new trades.")
+
     print(f"[API] Trade done: {direction} {clean_pair} ${amount} → {result} ({profit}) [{ml_tag}]")
     return success
 
@@ -195,14 +216,18 @@ async def schedule_entry(entry_time: str, ml_label=None):
     if DAILY_STOP_LOSS > 0 and halted_for_day:
         print("[HALT] Daily stop-loss reached; skip scheduled entry.")
         return
+
     tgt_local = to_next_or_now(entry_time)
-    print(f"[TIME] ET {entry_time} -> local {tgt_local.strftime('%Y-%m-%d %H:%M:%S')} now {datetime.now()}")
+    print(f"[TIME] ET {entry_time} -> VPS local {tgt_local.strftime('%Y-%m-%d %H:%M:%S')}  now {datetime.utcnow()}")
     await sleep_until(tgt_local)
+
     pair, direction, expiry = current["pair"], current["direction"], current["expiry_min"]
     amt = min(current["amount"], MAX_STAKE)
     label_str = f"ML{ml_label}" if ml_label else "BASE"
-    print(f"[EXECUTE] {pair} {direction} {expiry}m amount {amt} ({label_str}) @ {datetime.now().strftime('%H:%M:%S')}")
+    print(f"[EXECUTE] {pair} {direction} {expiry}m amount {amt} ({label_str}) @ {datetime.utcnow().strftime('%H:%M:%S')}")
+
     won = await run_one_trade(pair, direction, expiry, amt, ml_label=ml_label)
+
     if won:
         print("[ML] WIN → cancelling pending ML tasks and resetting to base")
         for t in scheduled_tasks:
@@ -211,6 +236,8 @@ async def schedule_entry(entry_time: str, ml_label=None):
         current.update({"active": False,"pair": None,"direction": None,
                         "ml_levels": [],"ml_i": 0,"amount": base_amount})
         return
+
+    # LOSS → schedule ML
     if current["ml_i"] < len(current["ml_levels"]):
         next_t = current["ml_levels"][current["ml_i"]]
         current["ml_i"] += 1
@@ -219,10 +246,12 @@ async def schedule_entry(entry_time: str, ml_label=None):
             current.update({"active": False,"pair": None,"direction": None,
                             "ml_levels": [],"ml_i": 0,"amount": base_amount})
             return
+
         next_amt = round(current["amount"] * mg_mult, 2)
         current["amount"] = min(next_amt, MAX_STAKE)
         if current["amount"] < next_amt:
             print(f"[CAP] ML amount capped to {current['amount']} (MAX_STAKE={MAX_STAKE})")
+
         print(f"[ML] LOSS → scheduling ML{current['ml_i']} at {next_t} amount={current['amount']}")
         task = asyncio.create_task(schedule_entry(next_t, ml_label=current["ml_i"]))
         scheduled_tasks.append(task)
@@ -238,7 +267,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
     if not sig: return False
     if msg_date:
         msg_age = (datetime.utcnow() - msg_date.replace(tzinfo=None)).total_seconds()
-        if msg_age > 120:
+        if msg_age > 300:
             print(f"[INFO] Stale message (age {msg_age:.1f}s) ignored.")
             return True
     if not hasattr(handle_signal_from_text, "_day"):
@@ -261,6 +290,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
     if not entry_still_relevant(sig["entry_time"]):
         print(f"[INFO] Signal entry {sig['entry_time']} too old; ignoring.")
         return True
+
     pair = sig["pair"]
     if FORCE_OTC and "OTC" not in pair.upper():
         pair = f"{pair} OTC"
@@ -298,6 +328,7 @@ async def main():
         except SessionPasswordNeededError:
             pw = input("Enter your Telegram 2FA password: ").strip()
             await client.sign_in(password=pw)
+
     me = await client.get_me()
     print(f"[DEBUG] Logged in as: {me.username or me.first_name} (ID {me.id})")
     entity = await client.get_entity(channel)
