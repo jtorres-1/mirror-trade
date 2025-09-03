@@ -5,6 +5,8 @@ const path = require("path");
 const express = require("express");
 const { chromium } = require("playwright");
 const fs = require("fs");
+require("dotenv").config();
+
 
 const PO_URL_TRADE = "https://pocketoption.com/en/cabinet/";
 const HEADLESS = process.env.HEADLESS === "1";
