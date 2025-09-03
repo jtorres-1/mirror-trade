@@ -59,7 +59,7 @@ async function waitForTradePanel() {
 }
 
 async function forceCloseOverlays() {
-  for (let i = 0; < 3; i++) {
+  for (let i = 0; i < 3; i++) {
     try { await page.keyboard.press('Escape'); } catch {}
     const overlay = page.locator(SEL.assetOverlay).first();
     const visible = await overlay.isVisible().catch(() => false);
