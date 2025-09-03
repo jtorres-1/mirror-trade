@@ -16,7 +16,9 @@ phone = os.getenv("PHONE_NUMBER")
 session_name = os.getenv("SESSION_NAME", "mirrortrade")
 channel = os.getenv("CHANNEL")
 
-tz_offset_minutes = int(os.getenv("TZ_OFFSET_MIN", "-240"))  # ET offset vs UTC (default: UTC-4)
+# IMPORTANT: .env has TZ_OFFSET_MIN=240 (ET is UTC-4). We negate it for UTC math -> -240.
+tz_offset_minutes = -abs(int(os.getenv("TZ_OFFSET_MIN", "240")))  # ET offset vs UTC (negative minutes)
+
 FORCE_OTC = os.getenv("FORCE_OTC", "1") == "1"
 base_amount = float(os.getenv("TRADE_AMOUNT", "1"))
 mg_mult = float(os.getenv("MARTINGALE_MULT", "2.2"))
@@ -63,9 +65,9 @@ def looks_like_summary(text: str) -> bool:
 
 def normalize_signal_text(text: str) -> str:
     text = text.replace('\u200b',' ')
-    text = text.replace("|", "\n")
-    text = emoji.replace_emoji(text, replace="")
-    text = re.sub(r"\s+", " ", text)
+    text = text.replace("|", "\n")               # turn pipes into newlines
+    text = emoji.replace_emoji(text, replace="") # strip emojis
+    text = re.sub(r"\s+", " ", text)             # collapse whitespace
     return text.strip()
 
 def parse_signal(text: str) -> Optional[Dict]:
@@ -102,7 +104,7 @@ def parse_signal(text: str) -> Optional[Dict]:
         if "LEVEL" in up:
             times = TIME_RE.findall(ln)
             for t in times:
-                if t != d["entry_time"]:
+                if t != d["entry_time"]:  # avoid duplicating entry
                     d["ml_levels"].append(t)
 
     # Fallbacks
@@ -118,33 +120,42 @@ def parse_signal(text: str) -> Optional[Dict]:
         return d
     return None
 
-# --- Time handling ---
+# --- Time handling (UTC internally, ET via tz_offset_minutes) ---
 def entry_local_from_et(hhmm: str) -> datetime:
-    """Convert ET hh:mm → local VPS datetime"""
+    """Convert ET hh:mm → correct UTC datetime. Rolls forward to next ET day if 'today ET' already passed."""
     hh, mm = map(int, hhmm.split(":"))
     now_utc = datetime.utcnow()
-    # Treat signal time as ET
-    et_today = now_utc + timedelta(minutes=tz_offset_minutes)
-    entry_et = et_today.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    # Convert back to UTC (VPS local time)
-    return entry_et - timedelta(minutes=tz_offset_minutes)
+    now_et = now_utc + timedelta(minutes=tz_offset_minutes)  # ET now
+
+    # Build 'today ET' at hh:mm
+    entry_et = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+    # If that ET time already passed (allow small slack), roll to next ET day
+    if entry_et < now_et - timedelta(seconds=2):
+        entry_et += timedelta(days=1)
+
+    # Convert ET -> UTC
+    entry_utc = entry_et - timedelta(minutes=tz_offset_minutes)
+    return entry_utc
 
 def to_next_or_now(hhmm: str) -> datetime:
     now = datetime.utcnow()
     tgt = entry_local_from_et(hhmm)
-    age_sec = (now - tgt).total_seconds()
-    if -300 <= age_sec <= 300:  # within ±5m → now
+    diff = (tgt - now).total_seconds()
+    # If target is within ±5m of now, execute immediately
+    if -300 <= diff <= 300:
         return now
-    if age_sec > 300:  # if already past, roll to next day
+    # If somehow target ended up in the past by more than 5m, bump a day
+    if diff < -300:
         tgt += timedelta(days=1)
     return tgt
 
 def entry_still_relevant(hhmm: str) -> bool:
+    """Accept signals up to 2 minutes late, and up to 12 hours ahead (overnight windows)."""
     now = datetime.utcnow()
     tgt = entry_local_from_et(hhmm)
     age_sec = (now - tgt).total_seconds()
-    # Accept if not more than 5m old and not further than 12h away
-    return -300 <= age_sec <= 12*3600
+    return -120 <= age_sec <= 12 * 3600
 
 def et_day_key() -> str:
     now_utc = datetime.utcnow()
@@ -160,7 +171,7 @@ scheduled_tasks = []
 
 daily_pnl = 0.0
 halted_for_day = False
-executor_busy = False
+executor_busy = False   # 🔒 ensure only one trade at a time
 
 async def sleep_until(when: datetime):
     delay = max(0, (when - datetime.utcnow()).total_seconds())
@@ -217,9 +228,15 @@ async def schedule_entry(entry_time: str, ml_label=None):
         print("[HALT] Daily stop-loss reached; skip scheduled entry.")
         return
 
-    tgt_local = to_next_or_now(entry_time)
-    print(f"[TIME] ET {entry_time} -> VPS local {tgt_local.strftime('%Y-%m-%d %H:%M:%S')}  now {datetime.utcnow()}")
-    await sleep_until(tgt_local)
+    tgt_utc = to_next_or_now(entry_time)
+    # helpful debug: show ET/UTC mapping on each schedule
+    now_utc = datetime.utcnow()
+    now_et = now_utc + timedelta(minutes=tz_offset_minutes)
+    tgt_et = tgt_utc + timedelta(minutes=tz_offset_minutes)
+    print(f"[TIME] now_utc {now_utc:%Y-%m-%d %H:%M:%S} | now_et {now_et:%Y-%m-%d %H:%M:%S} | "
+          f"entry_et {entry_time} | tgt_et {tgt_et:%Y-%m-%d %H:%M:%S} | tgt_utc {tgt_utc:%Y-%m-%d %H:%M:%S}")
+
+    await sleep_until(tgt_utc)
 
     pair, direction, expiry = current["pair"], current["direction"], current["expiry_min"]
     amt = min(current["amount"], MAX_STAKE)
@@ -265,11 +282,13 @@ async def handle_signal_from_text(text: str, msg_date=None):
     global last_signal_utc, daily_pnl, halted_for_day
     sig = parse_signal(text)
     if not sig: return False
+
     if msg_date:
         msg_age = (datetime.utcnow() - msg_date.replace(tzinfo=None)).total_seconds()
         if msg_age > 300:
             print(f"[INFO] Stale message (age {msg_age:.1f}s) ignored.")
             return True
+
     if not hasattr(handle_signal_from_text, "_day"):
         handle_signal_from_text._day = et_day_key()
     cur_day = et_day_key()
@@ -277,16 +296,20 @@ async def handle_signal_from_text(text: str, msg_date=None):
         daily_pnl = 0.0; halted_for_day = False
         handle_signal_from_text._day = cur_day
         print(f"[INFO] New ET day {cur_day}: daily PnL reset.")
+
     if DAILY_STOP_LOSS > 0 and halted_for_day:
         print("[HALT] Daily stop-loss reached; ignoring signals.")
         return True
+
     now_utc = datetime.utcnow()
     if last_signal_utc and (now_utc - last_signal_utc).total_seconds() < 60:
         print("[INFO] Duplicate/rapid signal ignored.")
         return True
+
     if current["active"]:
         print("[INFO] Chain active; ignoring new signal.")
         return True
+
     if not entry_still_relevant(sig["entry_time"]):
         print(f"[INFO] Signal entry {sig['entry_time']} too old; ignoring.")
         return True
@@ -294,11 +317,14 @@ async def handle_signal_from_text(text: str, msg_date=None):
     pair = sig["pair"]
     if FORCE_OTC and "OTC" not in pair.upper():
         pair = f"{pair} OTC"
+
     current.update({"active": True,"pair": pair,"direction": sig["direction"],
                     "expiry_min": sig["expiry_min"],"ml_levels": sig.get("ml_levels", []),
                     "ml_i": 0,"amount": base_amount})
+
     last_signal_utc = now_utc
     print(f"[SIGNAL] {pair} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} | ML {sig.get('ml_levels', [])}")
+
     task = asyncio.create_task(schedule_entry(sig["entry_time"]))
     scheduled_tasks.append(task)
     return True
@@ -308,13 +334,17 @@ async def on_signal(e):
         print(f"[INFO] Duplicate message ID {e.message.id} ignored.")
         return
     seen_ids.add(e.message.id)
+
     src = getattr(getattr(e, "chat", None), "title", None) or ""
     username = getattr(getattr(e, "chat", None), "username", None)
     print(f"[TG DEBUG] Incoming from: '{src}' (@{username})")
+
     text = (e.message.message or "").strip()
     print("[TG RAW]", text.replace("\n", " | ")[:500])
+
     ok = await handle_signal_from_text(text, msg_date=e.message.date)
-    if not ok: print("[TG DEBUG] Ignored: no valid signal found")
+    if not ok:
+        print("[TG DEBUG] Ignored: no valid signal found")
 
 # --- Main ---
 async def main():
