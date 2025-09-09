@@ -1,5 +1,5 @@
 # listen.py — Telegram -> PocketOption with martingale
-# Fix: Anchor entry_time to msg_date ET to resolve AM/PM and overnight sessions
+# Fix: Anchor entry_time to msg_date ET + send-early SKEW_MS for on-time entries
 
 import os, re, csv, asyncio, sys, requests
 from datetime import datetime, timedelta, timezone
@@ -24,15 +24,14 @@ base_amount = float(os.getenv("TRADE_AMOUNT", "1"))
 mg_mult = float(os.getenv("MARTINGALE_MULT", "2.2"))
 MAX_STAKE = float(os.getenv("MAX_STAKE", "10.65"))
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
+# NEW: fire slightly early to offset network/ui latency
+SKEW_MS = int(os.getenv("SKEW_MS", "2200"))  # adjust 1800–2800 if needed
 
 if not api_id or not api_hash:
-    print("[FATAL] API_ID/API_HASH missing in .env")
-    sys.exit(1)
+    print("[FATAL] API_ID/API_HASH missing in .env"); sys.exit(1)
 
 if not channel:
-    print("[FATAL] CHANNEL missing in .env")
-    sys.exit(1)
-
+    print("[FATAL] CHANNEL missing in .env"); sys.exit(1)
 if channel and not channel.startswith("@"):
     channel = "@" + channel
 
@@ -84,20 +83,16 @@ def parse_signal(text: str) -> Optional[Dict]:
     for ln in lines:
         up = ln.upper()
 
-        if "BUY" in up:
-            d["direction"] = "BUY"
-        if "SELL" in up:
-            d["direction"] = "SELL"
+        if "BUY" in up:  d["direction"] = "BUY"
+        if "SELL" in up: d["direction"] = "SELL"
 
         if "EXPIRATION" in up:
             m = MIN_RE.search(up)
-            if m:
-                d["expiry_min"] = int(m.group(1))
+            if m: d["expiry_min"] = int(m.group(1))
 
         if "ENTRY" in up:
             m = TIME_RE.search(ln)
-            if m:
-                d["entry_time"] = m.group(1)
+            if m: d["entry_time"] = m.group(1)
 
         if "LEVEL" in up:
             times = TIME_RE.findall(ln)
@@ -119,14 +114,11 @@ def resolve_entry_datetime(hhmm: str, msg_date_utc: datetime) -> datetime:
     msg_et = msg_date_utc + timedelta(minutes=tz_offset_minutes)
     candidate = msg_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
-    # If candidate is more than 6h before msg time, assume it's next day
     if (candidate - msg_et).total_seconds() < -6*3600:
         candidate += timedelta(days=1)
-    # If candidate is more than 18h ahead, roll back a day (mis-AM/PM)
     elif (candidate - msg_et).total_seconds() > 18*3600:
         candidate -= timedelta(days=1)
 
-    # Convert back to UTC
     return candidate - timedelta(minutes=tz_offset_minutes)
 
 def et_day_key() -> str:
@@ -200,8 +192,10 @@ async def schedule_entry(entry_dt: datetime, ml_label=None):
         print("[HALT] Daily stop-loss reached; skip scheduled entry.")
         return
 
-    print(f"[TIME] Target {entry_dt} (UTC)  now {datetime.utcnow()}")
-    await sleep_until(entry_dt)
+    # ---- send early by SKEW_MS to hit the correct window ----
+    fire_dt = entry_dt - timedelta(milliseconds=SKEW_MS)
+    print(f"[TIME] target={entry_dt} fire={fire_dt} now={datetime.utcnow()} skew_ms={SKEW_MS}")
+    await sleep_until(fire_dt)
 
     pair, direction, expiry = current["pair"], current["direction"], current["expiry_min"]
     amt = min(current["amount"], MAX_STAKE)
@@ -264,11 +258,9 @@ async def handle_signal_from_text(text: str, msg_date=None):
 
     now_utc = datetime.utcnow()
     if last_signal_utc and (now_utc - last_signal_utc).total_seconds() < 60:
-        print("[INFO] Duplicate/rapid signal ignored.")
-        return True
+        print("[INFO] Duplicate/rapid signal ignored."); return True
     if current["active"]:
-        print("[INFO] Chain active; ignoring new signal.")
-        return True
+        print("[INFO] Chain active; ignoring new signal."); return True
 
     pair = sig["pair"]
     if FORCE_OTC and "OTC" not in pair.upper():
@@ -284,8 +276,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
 
 async def on_signal(e):
     if e.message.id in seen_ids:
-        print(f"[INFO] Duplicate message ID {e.message.id} ignored.")
-        return
+        print(f"[INFO] Duplicate message ID {e.message.id} ignored."); return
     seen_ids.add(e.message.id)
     src = getattr(getattr(e, "chat", None), "title", None) or ""
     username = getattr(getattr(e, "chat", None), "username", None)
