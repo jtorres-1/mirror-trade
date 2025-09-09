@@ -140,7 +140,7 @@ async function selectPair(pair) {
   await page.keyboard.press('Escape').catch(() => {});
   await forceCloseOverlays();
 
-  await sleep(1500);
+  await sleep(150);
 }
 
 function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "") {
