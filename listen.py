@@ -206,8 +206,10 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None, anch
 def reset_chain():
     global current, scheduled_tasks
     for t in scheduled_tasks:
-        if not t.done():
-            t.cancel()
+        try:
+            t.cancel()  # works for both TimerHandle and asyncio.Task
+        except Exception:
+            pass
     scheduled_tasks.clear()
     current.update({"active": False,"pair": None,"direction": None,
                     "ml_levels": [],"ml_i": 0,"amount": base_amount,"anchor": None})
