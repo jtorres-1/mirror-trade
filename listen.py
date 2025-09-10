@@ -1,6 +1,6 @@
 # listen.py — Telegram -> PocketOption with martingale
 # Fix: Anchor entry_time to msg_date ET + send-early SKEW_MS for on-time entries
-# Update: ML1/ML2 now resolve entry times using the original msg_date anchor (no drift)
+# Update: ML1/ML2 use original msg_date anchor (no drift), async tasks prevent 5–11s lag
 
 import os, re, csv, asyncio, sys, requests
 from datetime import datetime, timedelta, timezone
@@ -140,7 +140,7 @@ async def sleep_until(when: datetime):
     await asyncio.sleep(delay)
 
 # --- Run one trade ---
-async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> bool:
+async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None, anchor_date=None) -> bool:
     global executor_busy, daily_pnl, halted_for_day
     if executor_busy:
         print("[BLOCK] Executor busy, skipping duplicate call.")
@@ -180,6 +180,31 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> b
         print(f"[HALT] Daily stop-loss reached. PnL={daily_pnl:.2f}, halting new trades.")
 
     print(f"[API] Trade done: {direction} {clean_pair} ${amount} → {result} ({profit}) [{ml_tag}]")
+
+    # ✅ Immediately schedule next ML if LOSS (no waiting drift)
+    if not success and ml_label != "ML2":
+        if current["ml_i"] < len(current["ml_levels"]):
+            next_t = current["ml_levels"][current["ml_i"]]
+            current["ml_i"] += 1
+            if current["ml_i"] >= 3:
+                print("[ML] ML3 disabled; chain ends at ML2.")
+                current.update({"active": False,"pair": None,"direction": None,
+                                "ml_levels": [],"ml_i": 0,"amount": base_amount,"anchor": None})
+            else:
+                next_amt = round(current["amount"] * mg_mult, 2)
+                current["amount"] = min(next_amt, MAX_STAKE)
+                print(f"[ML] LOSS → scheduling ML{current['ml_i']} at {next_t} amount={current['amount']}")
+                task = asyncio.create_task(schedule_entry(
+                    resolve_entry_datetime(next_t, anchor_date),
+                    ml_label=current["ml_i"],
+                    anchor_date=anchor_date
+                ))
+                scheduled_tasks.append(task)
+        else:
+            print("[ML] LOSS no levels left → reset")
+            current.update({"active": False,"pair": None,"direction": None,
+                            "ml_levels": [],"ml_i": 0,"amount": base_amount,"anchor": None})
+
     return success
 
 # --- ML scheduling ---
@@ -198,37 +223,7 @@ async def schedule_entry(entry_dt: datetime, ml_label=None, anchor_date=None):
     label_str = f"ML{ml_label}" if ml_label else "BASE"
     print(f"[EXECUTE] {pair} {direction} {expiry}m amount {amt} ({label_str}) @ {datetime.utcnow()}")
 
-    won = await run_one_trade(pair, direction, expiry, amt, ml_label=ml_label)
-
-    if won:
-        print("[ML] WIN → reset to base")
-        for t in scheduled_tasks:
-            if not t.done(): t.cancel()
-        scheduled_tasks.clear()
-        current.update({"active": False,"pair": None,"direction": None,
-                        "ml_levels": [],"ml_i": 0,"amount": base_amount,"anchor": None})
-        return
-
-    if current["ml_i"] < len(current["ml_levels"]):
-        next_t = current["ml_levels"][current["ml_i"]]
-        current["ml_i"] += 1
-        if current["ml_i"] >= 3:
-            print("[ML] ML3 disabled; chain ends at ML2.")
-            current.update({"active": False,"pair": None,"direction": None,
-                            "ml_levels": [],"ml_i": 0,"amount": base_amount,"anchor": None})
-            return
-        next_amt = round(current["amount"] * mg_mult, 2)
-        current["amount"] = min(next_amt, MAX_STAKE)
-        print(f"[ML] LOSS → scheduling ML{current['ml_i']} at {next_t} amount={current['amount']}")
-        # FIX: use anchor_date from original msg_date
-        task = asyncio.create_task(schedule_entry(
-            resolve_entry_datetime(next_t, anchor_date), ml_label=current["ml_i"], anchor_date=anchor_date
-        ))
-        scheduled_tasks.append(task)
-    else:
-        print("[ML] LOSS no levels left → reset")
-        current.update({"active": False,"pair": None,"direction": None,
-                        "ml_levels": [],"ml_i": 0,"amount": base_amount,"anchor": None})
+    await run_one_trade(pair, direction, expiry, amt, ml_label=ml_label, anchor_date=anchor_date)
 
 # --- Telegram handlers ---
 async def handle_signal_from_text(text: str, msg_date=None):
