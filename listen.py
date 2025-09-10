@@ -1,6 +1,7 @@
 # listen.py — Telegram -> PocketOption with martingale
 # Fix: Anchor entry_time to msg_date ET + send-early SKEW_MS for on-time entries
 # Update: ML1/ML2 use original msg_date anchor (no drift), async tasks prevent 5–11s lag
+# Fix: Reset chain immediately after base WIN (prevents "chain active" lockouts)
 
 import os, re, csv, asyncio, sys, requests
 from datetime import datetime, timedelta, timezone
@@ -181,7 +182,17 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None, anch
 
     print(f"[API] Trade done: {direction} {clean_pair} ${amount} → {result} ({profit}) [{ml_tag}]")
 
-    # ✅ Immediately schedule next ML if LOSS (no waiting drift)
+    # ✅ Reset immediately if base WIN
+    if ml_tag == "BASE" and success:
+        print("[RESET] Base WIN → chain reset, ready for new signals.")
+        for t in scheduled_tasks:
+            if not t.done(): t.cancel()
+        scheduled_tasks.clear()
+        current.update({"active": False,"pair": None,"direction": None,
+                        "ml_levels": [],"ml_i": 0,"amount": base_amount,"anchor": None})
+        return success
+
+    # ✅ If LOSS (base or ML1), schedule next ML immediately
     if not success and ml_label != "ML2":
         if current["ml_i"] < len(current["ml_levels"]):
             next_t = current["ml_levels"][current["ml_i"]]
