@@ -1,4 +1,4 @@
-# listen.py — Telegram -> PocketOption with martingale (hybrid, no-delay, no-ghosts)
+# listen.py — Telegram -> PocketOption with martingale (hybrid, no delay, no ghosts)
 # Strategy:
 #   • Pre-schedule Base, ML1, ML2 at signal time (SKEW_MS early fire).
 #   • Right before ML1/ML2 fires, do a just-in-time guard:
@@ -6,18 +6,18 @@
 #       - Fallback: cancel if a channel "WIN" message was seen moments ago.
 #   • On any WIN -> cancel all pending ML tasks and reset chain.
 #   • ML2 is the cap. After ML2 is placed, chain is freed for next signal.
+#   • TTL watchdog ensures chain is never stuck active across sessions or day rollovers.
 
-import os, re, csv, asyncio, sys, requests
+import os, re, csv, asyncio, sys, requests, emoji
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
-import emoji
 
 load_dotenv()
 
-# --- Env ---
+# Env
 api_id       = int(os.getenv("API_ID", "0"))
 api_hash     = os.getenv("API_HASH", "")
 phone        = os.getenv("PHONE_NUMBER")
@@ -39,10 +39,10 @@ if not channel:
 if channel and not channel.startswith("@"):
     channel = "@" + channel
 
-# --- Telegram client ---
+# Telegram client
 client = TelegramClient(session_name, api_id, api_hash)
 
-# --- Logging ---
+# Logging
 LOG_FILE = "trade_log.csv"
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", newline="") as f:
@@ -56,7 +56,7 @@ def log_trade(pair, direction, expiry_min, amount, result, profit, ml_tag=""):
             datetime.utcnow().isoformat(), pair, direction, expiry_min, amount, result, profit, ml_tag
         ])
 
-# --- Parsing ---
+# Parsing
 PAIR_RE = re.compile(r'([A-Z]{3}/[A-Z]{3})', re.I)
 TIME_RE = re.compile(r'(\d{1,2}:\d{2})')
 MIN_RE  = re.compile(r'(\d+)\s*m', re.I)
@@ -105,7 +105,7 @@ def parse_signal(text: str) -> Optional[Dict]:
         return d
     return None
 
-# --- Time handling ---
+# Time handling
 def resolve_entry_datetime(hhmm: str, msg_date_utc: datetime) -> datetime:
     hh, mm = map(int, hhmm.split(":"))
     msg_et = msg_date_utc + timedelta(minutes=tz_offset_minutes)
@@ -119,7 +119,7 @@ def et_day_key() -> str:
     now_et = now_utc + timedelta(minutes=tz_offset_minutes)
     return now_et.strftime("%Y-%m-%d")
 
-# --- Trade state ---
+# Trade state
 current = {
     "active": False, "pair": None, "direction": None, "expiry_min": 5,
     "ml_levels": [], "amount": base_amount, "anchor": None
@@ -156,7 +156,7 @@ def reset_chain(reason=""):
 last_win_ping_utc: Optional[datetime] = None
 WIN_HINT_RE = re.compile(r'\bWIN\b|\bVICTORY\b', re.I)
 
-# --- Executor helpers ---
+# Executor helpers
 PO_URL = "http://localhost:3000"
 
 def force_otc(pair: str) -> str:
@@ -195,13 +195,13 @@ def recent_win_ping(threshold_sec=8) -> bool:
         return False
     return (datetime.utcnow() - last_win_ping_utc).total_seconds() <= threshold_sec
 
-# --- Core trade execution ---
+# Core trade execution
 async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> None:
-    """Fire the click; we *do not* wait for result here (executor logs later)."""
+    """Fire the click; we do not wait for result here (executor logs later)."""
     global executor_busy, daily_pnl, halted_for_day
 
     if DAILY_STOP_LOSS > 0 and daily_pnl <= -DAILY_STOP_LOSS:
-        print("[HALT] Daily stop-loss reached. Skip trade.")
+        print("[HALT] Daily stop loss reached. Skip trade.")
         return
 
     if executor_busy:
@@ -223,14 +223,18 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
 
     executor_busy = False
 
-    # If this was ML2 placement, free the chain (no further legs)
+    # If this was ML2 placement, free the chain
     if ml_label == 2:
         print("[DONE] ML2 placed. Freeing chain for next signal.")
         reset_chain("ML2 placed; chain released.")
 
-# --- Scheduling with just-in-time cancellation ---
+    # If this was Base and no MLs are scheduled, free the chain to avoid permanent lock
+    if ml_label is None and not current.get("ml_levels"):
+        reset_chain("Base only signal completed; chain released.")
+
+# Scheduling with just in time cancellation
 async def schedule_leg(entry_dt: datetime, ml_label: Optional[int]):
-    """Schedule Base/ML1/ML2 with SKEW and JIT cancel for MLs."""
+    """Schedule Base, ML1, ML2 with SKEW and JIT cancel for MLs."""
     label = "BASE" if ml_label is None else f"ML{ml_label}"
     fire_dt = entry_dt - timedelta(milliseconds=SKEW_MS)
     now = datetime.utcnow()
@@ -267,14 +271,23 @@ async def schedule_leg(entry_dt: datetime, ml_label: Optional[int]):
         print(f"[CANCEL] {label} task cancelled.")
         return
 
-# --- Signal handling ---
+# TTL watchdog to prevent stuck chains
+async def _ttl_release(deadline_dt: datetime):
+    try:
+        # wait until the latest leg would finish, plus small buffer
+        await asyncio.sleep(max(0, (deadline_dt - datetime.utcnow()).total_seconds() + 70))
+        if current["active"]:
+            reset_chain("TTL watchdog")
+    except asyncio.CancelledError:
+        pass
+
+# Signal handling
 async def handle_signal_from_text(text: str, msg_date=None):
-    global last_signal_utc, daily_pnl, halted_for_day, current, scheduled_tasks
-    # 1) WIN pings (used for JIT cancel fallback)
+    global last_signal_utc, daily_pnl, halted_for_day, current, scheduled_tasks, last_win_ping_utc
+
+    # 1) WIN pings used for JIT cancel fallback
     if WIN_HINT_RE.search(text):
-        # store a time ping; we don't parse which leg here
-        globals()['last_win_ping_utc'] = datetime.utcnow()
-        # Don't return True; a WIN message isn't a "signal" to start a chain
+        last_win_ping_utc = datetime.utcnow()
         return False
 
     # 2) Trade signal
@@ -289,24 +302,27 @@ async def handle_signal_from_text(text: str, msg_date=None):
         print(f"[INFO] Signal {sig['entry_time']} too old; ignoring.")
         return True
 
-    # Reset daily PnL at ET day rollover
+    # ET day rollover
     if not hasattr(handle_signal_from_text, "_day"):
         handle_signal_from_text._day = et_day_key()
     cur_day = et_day_key()
     if cur_day != handle_signal_from_text._day:
-        daily_pnl = 0.0; halted_for_day = False
+        daily_pnl = 0.0
+        halted_for_day = False
         handle_signal_from_text._day = cur_day
-        print(f"[INFO] New ET day {cur_day}: daily PnL reset.")
+        reset_chain("ET day rollover")
 
     if DAILY_STOP_LOSS > 0 and halted_for_day:
-        print("[HALT] Stop-loss hit; ignoring signals.")
+        print("[HALT] Stop loss hit; ignoring signals.")
         return True
 
     now_utc = datetime.utcnow()
     if last_signal_utc and (now_utc - last_signal_utc).total_seconds() < 60:
-        print("[INFO] Rapid signal ignored."); return True
+        print("[INFO] Rapid signal ignored.")
+        return True
     if current["active"]:
-        print("[INFO] Chain active; ignoring new signal."); return True
+        print("[INFO] Chain active; ignoring new signal.")
+        return True
 
     pair = force_otc(sig["pair"])
     current.update({
@@ -317,15 +333,24 @@ async def handle_signal_from_text(text: str, msg_date=None):
     last_signal_utc = now_utc
     print(f"[SIGNAL] {pair} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} | ML {sig.get('ml_levels', [])}")
 
-    # Pre-schedule Base, ML1, ML2 (if provided)
+    # Pre schedule Base, ML1, ML2
     scheduled_tasks = []
     t0 = asyncio.create_task(schedule_leg(base_dt, None)); scheduled_tasks.append(t0)
+
+    latest_dt = base_dt
     if current["ml_levels"]:
         ml1_dt = resolve_entry_datetime(current["ml_levels"][0], msg_date.replace(tzinfo=None))
         t1 = asyncio.create_task(schedule_leg(ml1_dt, 1)); scheduled_tasks.append(t1)
+        latest_dt = ml1_dt
     if len(current["ml_levels"]) > 1:
         ml2_dt = resolve_entry_datetime(current["ml_levels"][1], msg_date.replace(tzinfo=None))
         t2 = asyncio.create_task(schedule_leg(ml2_dt, 2)); scheduled_tasks.append(t2)
+        latest_dt = ml2_dt
+
+    # TTL watchdog to guarantee release even if no WIN ping or ML legs fail to fire
+    ttl_task = asyncio.create_task(_ttl_release(latest_dt + timedelta(minutes=current["expiry_min"])))
+    scheduled_tasks.append(ttl_task)
+
     return True
 
 async def on_signal(e):
@@ -341,7 +366,7 @@ async def on_signal(e):
     if not ok:
         print("[TG DEBUG] Ignored: no valid trading signal")
 
-# --- Main ---
+# Main
 async def main():
     print("[DEBUG] Starting Telegram client...")
     await client.connect()
