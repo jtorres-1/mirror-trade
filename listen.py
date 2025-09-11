@@ -162,8 +162,8 @@ PO_URL = "http://localhost:3000"
 def force_otc(pair: str) -> str:
     return pair if (not FORCE_OTC or "OTC" in pair.upper()) else f"{pair} OTC"
 
-async def executor_trade(pair, amount, direction, ml_tag) -> Dict:
-    """Fire trade immediately; executor returns OPEN/PENDING. We log OPEN here."""
+def executor_trade(pair, amount, direction, ml_tag) -> Dict:
+    """Fire trade immediately via Node executor; returns dict."""
     payload = {"pair": pair, "amount": amount, "direction": direction.lower(), "ml_tag": ml_tag}
     try:
         r = requests.post(f"{PO_URL}/trade", json=payload, timeout=400)
@@ -176,15 +176,10 @@ async def executor_trade(pair, amount, direction, ml_tag) -> Dict:
     return {"success": False, "result": "OPEN", "profit": 0}
 
 def quick_peek_profit() -> Optional[float]:
-    """
-    Try to read the latest closed profit quickly via Node /peek.
-    If the endpoint isn't present, return None and rely on WIN ping fallback.
-    """
     try:
         r = requests.get(f"{PO_URL}/peek", timeout=2.0)
         if r.status_code == 200:
             j = r.json()
-            # expect shape: {"ok": true, "profit": 8.10}
             return float(j.get("profit", 0.0))
     except Exception:
         pass
@@ -197,13 +192,10 @@ def recent_win_ping(threshold_sec=8) -> bool:
 
 # Core trade execution
 async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> None:
-    """Fire the click; we do not wait for result here (executor logs later)."""
     global executor_busy, daily_pnl, halted_for_day
-
     if DAILY_STOP_LOSS > 0 and daily_pnl <= -DAILY_STOP_LOSS:
         print("[HALT] Daily stop loss reached. Skip trade.")
         return
-
     if executor_busy:
         print("[BLOCK] Executor busy; skipping overlapping call.")
         return
@@ -212,69 +204,54 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
     clean_pair = force_otc(pair)
     ml_tag = "BASE" if not ml_label else f"ML{ml_label}"
 
-    data = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: executor_trade(clean_pair, amount, direction, ml_tag)
-    )
-    # We expect result to be "PENDING"/"OPEN" here; log as OPEN (no chain decision now)
-    result = data.get("result", "OPEN")
-    profit = float(data.get("profit", 0))
-    log_trade(clean_pair, direction, expiry_min, amount, result, profit, ml_tag)
-    print(f"[API] Fired: {direction} {clean_pair} ${amount} [{ml_tag}] → {result}")
+    try:
+        data = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: executor_trade(clean_pair, amount, direction, ml_tag)
+        )
+        result = data.get("result", "OPEN")
+        profit = float(data.get("profit", 0))
+        log_trade(clean_pair, direction, expiry_min, amount, result, profit, ml_tag)
+        print(f"[API] Fired: {direction} {clean_pair} ${amount} [{ml_tag}] → {result}")
+    finally:
+        executor_busy = False
 
-    executor_busy = False
-
-    # If this was ML2 placement, free the chain
     if ml_label == 2:
         print("[DONE] ML2 placed. Freeing chain for next signal.")
         reset_chain("ML2 placed; chain released.")
-
-    # If this was Base and no MLs are scheduled, free the chain to avoid permanent lock
     if ml_label is None and not current.get("ml_levels"):
         reset_chain("Base only signal completed; chain released.")
 
 # Scheduling with just in time cancellation
 async def schedule_leg(entry_dt: datetime, ml_label: Optional[int]):
-    """Schedule Base, ML1, ML2 with SKEW and JIT cancel for MLs."""
     label = "BASE" if ml_label is None else f"ML{ml_label}"
     fire_dt = entry_dt - timedelta(milliseconds=SKEW_MS)
     now = datetime.utcnow()
     delay = max(0.0, (fire_dt - now).total_seconds())
     print(f"[SCHEDULE] {label} fire={fire_dt} (target={entry_dt}) delay={delay:.3f}s")
     try:
-        # Wake slightly before fire to run JIT guard for ML1/ML2
         wake_early = max(0.0, delay - 0.9)
         await asyncio.sleep(wake_early)
-
         if ml_label in (1, 2):
-            # JIT cancel: prefer PO peek, fallback to channel WIN ping
             p = quick_peek_profit()
-            if p is not None:
-                if p > 0:
-                    reset_chain(f"{label} cancelled: previous leg WIN via /peek (profit {p})")
-                    return
-            else:
-                if recent_win_ping(8):
-                    reset_chain(f"{label} cancelled: WIN ping from channel")
-                    return
-
-        # Sleep remaining tiny slice to align to skewed time
+            if p is not None and p > 0:
+                reset_chain(f"{label} cancelled: previous leg WIN via /peek (profit {p})")
+                return
+            if p is None and recent_win_ping(8):
+                reset_chain(f"{label} cancelled: WIN ping from channel")
+                return
         now2 = datetime.utcnow()
         rem = max(0.0, (fire_dt - now2).total_seconds())
         if rem:
             await asyncio.sleep(rem)
-
-        # Place the leg
         amt = base_amount if ml_label is None else min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
         await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=ml_label)
-
     except asyncio.CancelledError:
         print(f"[CANCEL] {label} task cancelled.")
         return
 
-# TTL watchdog to prevent stuck chains
+# TTL watchdog
 async def _ttl_release(deadline_dt: datetime):
     try:
-        # wait until the latest leg would finish, plus small buffer
         await asyncio.sleep(max(0, (deadline_dt - datetime.utcnow()).total_seconds() + 70))
         if current["active"]:
             reset_chain("TTL watchdog")
@@ -284,46 +261,32 @@ async def _ttl_release(deadline_dt: datetime):
 # Signal handling
 async def handle_signal_from_text(text: str, msg_date=None):
     global last_signal_utc, daily_pnl, halted_for_day, current, scheduled_tasks, last_win_ping_utc
-
-    # 1) WIN pings used for JIT cancel fallback
     if WIN_HINT_RE.search(text):
         last_win_ping_utc = datetime.utcnow()
         return False
-
-    # 2) Trade signal
     sig = parse_signal(text)
     if not sig:
         return False
     if not msg_date:
         msg_date = datetime.utcnow().replace(tzinfo=timezone.utc)
-
     base_dt = resolve_entry_datetime(sig["entry_time"], msg_date.replace(tzinfo=None))
     if (datetime.utcnow() - base_dt).total_seconds() > 300:
         print(f"[INFO] Signal {sig['entry_time']} too old; ignoring.")
         return True
-
-    # ET day rollover
     if not hasattr(handle_signal_from_text, "_day"):
         handle_signal_from_text._day = et_day_key()
     cur_day = et_day_key()
     if cur_day != handle_signal_from_text._day:
-        daily_pnl = 0.0
-        halted_for_day = False
+        daily_pnl = 0.0; halted_for_day = False
         handle_signal_from_text._day = cur_day
         reset_chain("ET day rollover")
-
     if DAILY_STOP_LOSS > 0 and halted_for_day:
-        print("[HALT] Stop loss hit; ignoring signals.")
-        return True
-
+        print("[HALT] Stop loss hit; ignoring signals."); return True
     now_utc = datetime.utcnow()
     if last_signal_utc and (now_utc - last_signal_utc).total_seconds() < 60:
-        print("[INFO] Rapid signal ignored.")
-        return True
+        print("[INFO] Rapid signal ignored."); return True
     if current["active"]:
-        print("[INFO] Chain active; ignoring new signal.")
-        return True
-
+        print("[INFO] Chain active; ignoring new signal."); return True
     pair = force_otc(sig["pair"])
     current.update({
         "active": True, "pair": pair, "direction": sig["direction"],
@@ -332,11 +295,8 @@ async def handle_signal_from_text(text: str, msg_date=None):
     })
     last_signal_utc = now_utc
     print(f"[SIGNAL] {pair} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} | ML {sig.get('ml_levels', [])}")
-
-    # Pre schedule Base, ML1, ML2
     scheduled_tasks = []
     t0 = asyncio.create_task(schedule_leg(base_dt, None)); scheduled_tasks.append(t0)
-
     latest_dt = base_dt
     if current["ml_levels"]:
         ml1_dt = resolve_entry_datetime(current["ml_levels"][0], msg_date.replace(tzinfo=None))
@@ -346,11 +306,8 @@ async def handle_signal_from_text(text: str, msg_date=None):
         ml2_dt = resolve_entry_datetime(current["ml_levels"][1], msg_date.replace(tzinfo=None))
         t2 = asyncio.create_task(schedule_leg(ml2_dt, 2)); scheduled_tasks.append(t2)
         latest_dt = ml2_dt
-
-    # TTL watchdog to guarantee release even if no WIN ping or ML legs fail to fire
     ttl_task = asyncio.create_task(_ttl_release(latest_dt + timedelta(minutes=current["expiry_min"])))
     scheduled_tasks.append(ttl_task)
-
     return True
 
 async def on_signal(e):
@@ -378,7 +335,6 @@ async def main():
         except SessionPasswordNeededError:
             pw = input("Enter your 2FA password: ").strip()
             await client.sign_in(password=pw)
-
     me = await client.get_me()
     print(f"[DEBUG] Logged in as: {me.username or me.first_name} (ID {me.id})")
     entity = await client.get_entity(channel)
