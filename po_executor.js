@@ -1,6 +1,7 @@
-// po_executor.js — Hardened executor
-// Fix: Scoped selectors, single-click guard, pair-switch delay, ML tag logging
-// Update: Executor now WAITS until trade closes before responding (no fake LOSS 0.0)
+// po_executor.js — Executor with instant OPEN + background result parse
+// Fix: Returns "OPEN" immediately → ML can pre-schedule
+// Background: After ~5m, parse Closed tab and log WIN/LOSS
+// Chain logic is now correct with listen.py
 
 const path = require("path");
 const express = require("express");
@@ -48,16 +49,8 @@ async function withRetry(fn, attempts = 2, label = "op") {
 }
 
 async function waitForTradePanel() {
-  try {
-    await page.waitForSelector(SEL.tradePanel, { timeout: DEFAULT_TIMEOUT });
-    console.log("[✅] Trade panel detected");
-  } catch (err) {
-    console.error("[❌] Trade panel NOT found:", err.message);
-    const file = path.join(SCREEN_DIR, `no_tradepanel_${Date.now()}.png`);
-    await page.screenshot({ path: file }).catch(() => {});
-    console.log("[📸] Screenshot saved:", file);
-    throw err;
-  }
+  await page.waitForSelector(SEL.tradePanel, { timeout: DEFAULT_TIMEOUT });
+  console.log("[✅] Trade panel detected");
 }
 
 async function forceCloseOverlays() {
@@ -86,7 +79,7 @@ async function ensureOnPO() {
 
 async function ensurePageAlive() {
   if (!page || page.isClosed()) {
-    console.log("[Heal] Page was closed. Re-initializing browser…");
+    console.log("[Heal] Page closed. Restarting browser…");
     await initBrowser();
     return;
   }
@@ -139,7 +132,6 @@ async function selectPair(pair) {
   console.log(`[Step] Selected pair: ${pair}`);
   await page.keyboard.press('Escape').catch(() => {});
   await forceCloseOverlays();
-
   await sleep(150);
 }
 
@@ -175,7 +167,6 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
     : panel.locator(SEL.sellBtn).first();
 
   await btn.waitFor({ state: 'visible', timeout: DEFAULT_TIMEOUT });
-
   console.log(`[CLICK] ${direction.toUpperCase()} button for ${pair} @ $${amount}`);
 
   try {
@@ -187,52 +178,51 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   }
 
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
-
-  // -------- Wait until trade closes and return real result ----------
-  await sleep(305000); // ~5 minutes for expiry
-  let profit = 0.0, result = "LOSS";
-  try {
-    await page.locator(SEL.closedTab).click({ timeout: 5000 });
-    const row = page.locator(SEL.closedRow).first();
-    await row.waitFor({ state: "visible", timeout: 15000 });
-    const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
-    console.log(`[Debug] Closed row text: ${rowText}`);
-
-    const profitMatches = rowText.match(/\$[0-9.]+/g);
-    if (profitMatches?.length) {
-      const lastVal = profitMatches[profitMatches.length - 1];
-      profit = parseFloat(lastVal.replace("$", ""));
-      result = profit > 0 ? "WIN" : "LOSS";
-    }
-  } catch (err) {
-    console.error("[❌] Result parse failed:", err.message);
-  }
-
-  const ts = new Date().toISOString();
-  appendLog(ts, pair, direction, amount, result, profit, ml_tag);
-
   tradeInProgress = false;
-  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""}`);
-  return { success: true, result, profit, ml_tag };
+
+  // return immediately with OPEN
+  const ts = new Date().toISOString();
+  appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag);
+
+  // Background parse after expiry
+  (async () => {
+    await sleep(305000); // ~5m expiry
+    let profit = 0.0, result = "LOSS";
+    try {
+      await page.locator(SEL.closedTab).click({ timeout: 5000 });
+      const row = page.locator(SEL.closedRow).first();
+      await row.waitFor({ state: "visible", timeout: 15000 });
+      const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
+      console.log(`[Debug] Closed row text: ${rowText}`);
+
+      const profitMatches = rowText.match(/\$[0-9.]+/g);
+      if (profitMatches?.length) {
+        const lastVal = profitMatches[profitMatches.length - 1];
+        profit = parseFloat(lastVal.replace("$", ""));
+        result = profit > 0 ? "WIN" : "LOSS";
+      }
+    } catch (err) {
+      console.error("[❌] Result parse failed:", err.message);
+    }
+
+    const ts2 = new Date().toISOString();
+    appendLog(ts2, pair, direction, amount, result, profit, ml_tag);
+    console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""}`);
+  })();
+
+  return { success: true, result: "OPEN", profit: 0, ml_tag };
 }
 
 // ----------------------------- Browser Init ---------------------------------
 async function initBrowser() {
-  console.log("[Init] Launching PocketOption with saved storage state…");
+  console.log("[Init] Launching PocketOption…");
   const browser = await chromium.launch({ headless: HEADLESS, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
   context = await browser.newContext({ storageState: "po_storage.json" });
-
   page = await context.newPage();
   page.setDefaultTimeout(DEFAULT_TIMEOUT);
 
-  page.on("close", () => console.warn("[Warn] Page closed event detected."));
-  context.on("close", () => console.warn("[Warn] Context closed event detected."));
-
   await page.goto(PO_URL_TRADE, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
   await ensureOnPO();
-  const file = path.join(SCREEN_DIR, `init_ready_${Date.now()}.png`);
-  await page.screenshot({ path: file }).catch(() => {});
-  console.log("[📸] Screenshot after init saved:", file);
   console.log("[Init] PocketOption ready.");
 }
 
@@ -244,7 +234,6 @@ app.post("/trade", async (req, res) => {
   console.log("[REQ] Incoming trade request:", req.body);
   const { pair, amount, direction, ml_tag } = req.body || {};
   if (!pair || !amount || !direction) {
-    console.error("[❌] Missing required fields:", req.body);
     return res.status(400).json({ success: false, error: "pair, amount, direction required" });
   }
   try {
@@ -261,10 +250,6 @@ app.listen(3000, async () => {
   console.log("[Server] Executor API listening on http://localhost:3000");
 });
 
-process.on("SIGINT", async () => {
-  console.log("[Shutdown] Closing context…");
-  try { await context?.close(); } catch {}
-  process.exit(0);
-});
+process.on("SIGINT", async () => { try { await context?.close(); } catch {} process.exit(0); });
 process.on("unhandledRejection", (err) => console.error("[UnhandledRejection]", err));
 process.on("uncaughtException", (err) => console.error("[UncaughtException]", err));
