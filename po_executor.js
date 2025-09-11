@@ -1,7 +1,8 @@
 // po_executor.js — Executor with instant OPEN + background result parse
-// Fix: Returns "OPEN" immediately → ML can pre-schedule
-// Background: After ~5m, parse Closed tab and log WIN/LOSS
-// Chain logic is now correct with listen.py
+// Fixes:
+//   1. Added /peek endpoint so Python can cancel ML legs on WIN
+//   2. Result parser now matches trade by amount (no false LOSS spam)
+//   3. Regex updated to allow negative profits
 
 const path = require("path");
 const express = require("express");
@@ -143,6 +144,7 @@ function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "") {
   fs.appendFileSync(LOG_FILE, `${ts},${pair},${dir},${amount},${result},${profit},${ml_tag}\n`);
 }
 
+// ----------------------------- Trade Placement ------------------------------
 async function placeTrade(pair, amount, direction, ml_tag = "") {
   if (tradeInProgress) {
     console.warn("[Guard] Trade already in progress. Skipping duplicate request.");
@@ -184,18 +186,31 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   const ts = new Date().toISOString();
   appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag);
 
-  // Background parse after expiry
+  // Background parse after expiry — MATCH BY AMOUNT
   (async () => {
     await sleep(305000); // ~5m expiry
     let profit = 0.0, result = "LOSS";
     try {
       await page.locator(SEL.closedTab).click({ timeout: 5000 });
-      const row = page.locator(SEL.closedRow).first();
-      await row.waitFor({ state: "visible", timeout: 15000 });
-      const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
-      console.log(`[Debug] Closed row text: ${rowText}`);
 
-      const profitMatches = rowText.match(/\$[0-9.]+/g);
+      // scan a few top rows, pick one that matches our amount
+      const rows = page.locator(SEL.closedRow).slice(0, 5);
+      const count = await rows.count();
+      let matched = null;
+
+      for (let i = 0; i < count; i++) {
+        const txt = (await rows.nth(i).innerText()).replace(/\n/g, " ").trim();
+        const money = txt.match(/\$-?[0-9.]+/g) || [];
+        if (money.some(v => parseFloat(v.replace("$", "")) === Number(amount))) {
+          matched = txt;
+          break;
+        }
+      }
+
+      const rowText = matched || (await rows.first().innerText()).replace(/\n/g, " ").trim();
+      console.log(`[Debug] Closed row text (matched): ${rowText}`);
+
+      const profitMatches = rowText.match(/\$-?[0-9.]+/g);
       if (profitMatches?.length) {
         const lastVal = profitMatches[profitMatches.length - 1];
         profit = parseFloat(lastVal.replace("$", ""));
@@ -213,20 +228,23 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   return { success: true, result: "OPEN", profit: 0, ml_tag };
 }
 
-// ----------------------------- Browser Init ---------------------------------
-async function initBrowser() {
-  console.log("[Init] Launching PocketOption…");
-  const browser = await chromium.launch({ headless: HEADLESS, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
-  context = await browser.newContext({ storageState: "po_storage.json" });
-  page = await context.newPage();
-  page.setDefaultTimeout(DEFAULT_TIMEOUT);
+// ----------------------------- Peek Endpoint --------------------------------
+async function peekLatestProfit() {
+  await ensurePageAlive();
+  try { await page.locator(SEL.closedTab).click({ timeout: 3000 }); } catch {}
+  const row = page.locator(SEL.closedRow).first();
+  const visible = await row.isVisible().catch(() => false);
+  if (!visible) return null;
 
-  await page.goto(PO_URL_TRADE, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
-  await ensureOnPO();
-  console.log("[Init] PocketOption ready.");
+  const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
+  const profitMatches = rowText.match(/\$-?[0-9.]+/g);
+  if (profitMatches?.length) {
+    const lastVal = profitMatches[profitMatches.length - 1];
+    return parseFloat(lastVal.replace("$", ""));
+  }
+  return null;
 }
 
-// ----------------------------- HTTP API -------------------------------------
 const app = express();
 app.use(express.json());
 
@@ -245,6 +263,30 @@ app.post("/trade", async (req, res) => {
   }
 });
 
+app.get("/peek", async (req, res) => {
+  try {
+    const profit = await peekLatestProfit();
+    if (profit === null) return res.json({ ok: false, profit: 0 });
+    return res.json({ ok: true, profit });
+  } catch (err) {
+    return res.json({ ok: false, error: err?.message || String(err), profit: 0 });
+  }
+});
+
+// ----------------------------- Browser Init ---------------------------------
+async function initBrowser() {
+  console.log("[Init] Launching PocketOption…");
+  const browser = await chromium.launch({ headless: HEADLESS, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+  context = await browser.newContext({ storageState: "po_storage.json" });
+  page = await context.newPage();
+  page.setDefaultTimeout(DEFAULT_TIMEOUT);
+
+  await page.goto(PO_URL_TRADE, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
+  await ensureOnPO();
+  console.log("[Init] PocketOption ready.");
+}
+
+// ----------------------------- Server ---------------------------------------
 app.listen(3000, async () => {
   await initBrowser();
   console.log("[Server] Executor API listening on http://localhost:3000");
