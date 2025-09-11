@@ -1,12 +1,12 @@
 // po_executor.js — Hardened executor
 // Fix: Scoped selectors, single-click guard, pair-switch delay, ML tag logging
+// Update: Decoupled trade execution from result parsing (no 5–11s ML delay)
 
 const path = require("path");
 const express = require("express");
 const { chromium } = require("playwright");
 const fs = require("fs");
 require("dotenv").config();
-
 
 const PO_URL_TRADE = "https://pocketoption.com/en/cabinet/";
 const HEADLESS = process.env.HEADLESS === "1";
@@ -188,33 +188,35 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
 
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
 
-  await sleep(305000);
-
-  await page.locator(SEL.closedTab).click({ timeout: 5000 }).catch(() => {
-    throw new Error("Failed to click Closed tab");
-  });
-
-  const row = page.locator(SEL.closedRow).first();
-  await row.waitFor({ state: "visible", timeout: 10000 });
-
-  const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
-  console.log(`[Debug] Closed row text: ${rowText}`);
-
-  let profit = 0.0, result = "LOSS";
-  const profitMatches = rowText.match(/\$[0-9.]+/g);
-  if (profitMatches && profitMatches.length > 0) {
-    const lastVal = profitMatches[profitMatches.length - 1];
-    profit = parseFloat(lastVal.replace("$", ""));
-    result = profit > 0 ? "WIN" : "LOSS";
-  }
-
-  const ts = new Date().toISOString();
-  appendLog(ts, pair, direction, amount, result, profit, ml_tag);
-
-  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""}`);
-
+  // -------- NEW: Free executor immediately, log result later ----------
   tradeInProgress = false;
-  return { success: true, result, profit, ml_tag };
+
+  (async () => {
+    await sleep(305000); // wait ~5m for expiry
+    try {
+      await page.locator(SEL.closedTab).click({ timeout: 5000 });
+      const row = page.locator(SEL.closedRow).first();
+      await row.waitFor({ state: "visible", timeout: 10000 });
+      const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
+      console.log(`[Debug] Closed row text: ${rowText}`);
+
+      let profit = 0.0, result = "LOSS";
+      const profitMatches = rowText.match(/\$[0-9.]+/g);
+      if (profitMatches && profitMatches.length > 0) {
+        const lastVal = profitMatches[profitMatches.length - 1];
+        profit = parseFloat(lastVal.replace("$", ""));
+        result = profit > 0 ? "WIN" : "LOSS";
+      }
+
+      const ts = new Date().toISOString();
+      appendLog(ts, pair, direction, amount, result, profit, ml_tag);
+      console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""}`);
+    } catch (err) {
+      console.error("[❌] Result parse failed:", err.message);
+    }
+  })();
+
+  return { success: true, result: "PENDING", profit: 0, ml_tag };
 }
 
 // ----------------------------- Browser Init ---------------------------------
