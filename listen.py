@@ -1,8 +1,7 @@
 # listen.py — Telegram -> PocketOption with martingale
-# Fix: Absolute timestamp scheduling (no drift)
-# Fix: Pre-schedule ML1/ML2 at signal time; cancel on wins (no 5–11s lag)
+# Fix: Schedule ML1 only after Base LOSS, ML2 only after ML1 LOSS (no pre-scheduling drift)
 # Fix: Always reset chain after Base/ML1/ML2 finishes
-# Logic: ML1 only after Base loss, ML2 only after ML1 loss (by cancelling on wins)
+# Logic: ML1 only after Base loss, ML2 only after ML1 loss (ML3 disabled)
 
 import os, re, csv, asyncio, sys, requests
 from datetime import datetime, timedelta, timezone
@@ -133,52 +132,28 @@ current = {
     "direction": None,
     "expiry_min": 5,
     "ml_levels": [],
-    "amounts": {0: base_amount, 1: round(base_amount * mg_mult, 2), 2: round(base_amount * mg_mult * mg_mult, 2)},
+    "amount": base_amount,
     "anchor": None
 }
 last_signal_utc: Optional[datetime] = None
 seen_ids = set()
-
-# Timer handles per level (0=BASE,1=ML1,2=ML2)
-scheduled_handles: Dict[int, object] = {}
 
 daily_pnl = 0.0
 halted_for_day = False
 executor_busy = False
 
 # --- Utilities ---
-def cancel_handle(h):
-    try:
-        h.cancel()
-    except Exception:
-        pass
-
-def cancel_levels(levels):
-    for lv in levels:
-        h = scheduled_handles.pop(lv, None)
-        if h is not None:
-            cancel_handle(h)
-
 def reset_chain():
-    global current, scheduled_handles
-    # Cancel anything left
-    cancel_levels(list(scheduled_handles.keys()))
-    scheduled_handles.clear()
-    # Reset state
+    global current
     current.update({
         "active": False, "pair": None, "direction": None,
         "expiry_min": 5, "ml_levels": [],
-        "amounts": {0: base_amount, 1: round(base_amount * mg_mult, 2), 2: round(base_amount * mg_mult * mg_mult, 2)},
-        "anchor": None
+        "amount": base_amount, "anchor": None
     })
     print("[RESET] Chain cleared → active=False")
 
 # --- Core trade execution ---
-async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> bool:
-    """
-    Executes one trade at the scheduled time.
-    ml_label: None/0=BASE, 1=ML1, 2=ML2
-    """
+async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None, anchor_date=None) -> bool:
     global executor_busy, daily_pnl, halted_for_day
 
     if DAILY_STOP_LOSS > 0 and daily_pnl <= -DAILY_STOP_LOSS:
@@ -194,8 +169,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> b
     if FORCE_OTC and "OTC" not in clean_pair.upper():
         clean_pair = f"{clean_pair} OTC"
 
-    label_num = 0 if (ml_label in (None, 0)) else ml_label
-    ml_tag = "BASE" if label_num == 0 else f"ML{label_num}"
+    ml_tag = "BASE" if not ml_label else f"ML{ml_label}"
     success, result, profit = False, "ERROR", 0.0
 
     try:
@@ -208,8 +182,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> b
             data = res.json()
             result = data.get("result", "LOSS")
             profit = float(data.get("profit", 0))
-            if profit <= 0:
-                result = "LOSS"
+            if profit <= 0: result = "LOSS"
             success = (result == "WIN")
         else:
             print(f"[API ERROR] {res.status_code}: {res.text}")
@@ -226,65 +199,48 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> b
 
     print(f"[API] Trade done: {direction} {clean_pair} ${amount} → {result} ({profit}) [{ml_tag}]")
 
-    # --- Cancel/continue logic (no re-scheduling here) ---
+    # --- Chain management ---
     if success:
-        # On any WIN, cancel all *future* levels
-        if label_num == 0:          # Base WIN cancels ML1/ML2
-            cancel_levels([1, 2])
-        elif label_num == 1:        # ML1 WIN cancels ML2
-            cancel_levels([2])
-        # Chain complete on win at any level
+        print(f"[RESET] {ml_tag} WIN → chain reset.")
         reset_chain()
         return True
 
-    # LOSS:
-    if label_num == 0:
-        # Base LOSS → do nothing; ML1 already pre-scheduled
-        print("[SEQ] Base LOSS → waiting for pre-scheduled ML1.")
-    elif label_num == 1:
-        # ML1 LOSS → do nothing; ML2 already pre-scheduled
-        print("[SEQ] ML1 LOSS → waiting for pre-scheduled ML2.")
-    else:
-        # ML2 LOSS ends chain
-        print("[SEQ] ML2 LOSS → sequence finished. Reset.")
-        reset_chain()
+    if not success:
+        if ml_label is None:  # base loss
+            if current["ml_levels"]:
+                next_t = resolve_entry_datetime(current["ml_levels"][0], anchor_date)
+                asyncio.create_task(schedule_trade(next_t, 1, anchor_date))
+        elif ml_label == 1:  # ML1 loss
+            if len(current["ml_levels"]) > 1:
+                next_t = resolve_entry_datetime(current["ml_levels"][1], anchor_date)
+                asyncio.create_task(schedule_trade(next_t, 2, anchor_date))
+        else:  # ML2 loss ends chain
+            print("[RESET] ML2 LOSS → reset chain.")
+            reset_chain()
 
     return success
 
-# --- Scheduling helpers ---
-def schedule_level_at(entry_dt: datetime, level: int):
-    """Schedule a level at absolute time minus skew."""
-    if level not in (0, 1, 2):
-        return
+# --- Scheduling ---
+async def schedule_trade(entry_dt: datetime, ml_label, anchor_date):
     fire_dt = entry_dt - timedelta(milliseconds=SKEW_MS)
-    delay = max(0.0, (fire_dt - datetime.utcnow()).total_seconds())
-    loop = asyncio.get_event_loop()
-    amt = min(current["amounts"][level], MAX_STAKE)
-    print(f"[SCHEDULE] L{level} fire={fire_dt} (target={entry_dt}) delay={delay:.3f}s amount={amt}")
-    handle = loop.call_later(
-        delay,
-        lambda: asyncio.create_task(
-            run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=level)
-        )
-    )
-    scheduled_handles[level] = handle
+    delay = max(0, (fire_dt - datetime.utcnow()).total_seconds())
+    print(f"[SCHEDULE] ML{ml_label or 0} fire={fire_dt} (target={entry_dt}) delay={delay:.3f}s")
+    await asyncio.sleep(delay)
+    amt = min(round(current["amount"] * (mg_mult ** ml_label), 2), MAX_STAKE) if ml_label else base_amount
+    await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=ml_label, anchor_date=anchor_date)
 
 # --- Signal handling ---
 async def handle_signal_from_text(text: str, msg_date=None):
     global last_signal_utc, daily_pnl, halted_for_day, current
     sig = parse_signal(text)
-    if not sig:
-        return False
-    if not msg_date:
-        msg_date = datetime.utcnow().replace(tzinfo=timezone.utc)
+    if not sig: return False
+    if not msg_date: msg_date = datetime.utcnow().replace(tzinfo=timezone.utc)
 
-    # Resolve absolute times
     base_dt = resolve_entry_datetime(sig["entry_time"], msg_date.replace(tzinfo=None))
     if (datetime.utcnow() - base_dt).total_seconds() > 300:
         print(f"[INFO] Signal entry {sig['entry_time']} too old (resolved {base_dt}); ignoring.")
         return True
 
-    # Day rollover reset
     if not hasattr(handle_signal_from_text, "_day"):
         handle_signal_from_text._day = et_day_key()
     cur_day = et_day_key()
@@ -303,40 +259,17 @@ async def handle_signal_from_text(text: str, msg_date=None):
     if current["active"]:
         print("[INFO] Chain active; ignoring new signal."); return True
 
-    # Normalize pair
     pair = sig["pair"]
     if FORCE_OTC and "OTC" not in pair.upper():
         pair = f"{pair} OTC"
 
-    # Initialize chain state
-    current.update({
-        "active": True,
-        "pair": pair,
-        "direction": sig["direction"],
-        "expiry_min": sig["expiry_min"],
-        "ml_levels": sig.get("ml_levels", []),
-        "amounts": {
-            0: base_amount,
-            1: min(round(base_amount * mg_mult, 2), MAX_STAKE),
-            2: min(round(base_amount * mg_mult * mg_mult, 2), MAX_STAKE),
-        },
-        "anchor": msg_date.replace(tzinfo=None)
-    })
+    current.update({"active": True,"pair": pair,"direction": sig["direction"],
+                    "expiry_min": sig["expiry_min"],"ml_levels": sig.get("ml_levels", []),
+                    "amount": base_amount,"anchor": msg_date.replace(tzinfo=None)})
     last_signal_utc = now_utc
-    print(f"[SIGNAL] {pair} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} "
-          f"| ML {sig.get('ml_levels', [])}")
+    print(f"[SIGNAL] {pair} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} | ML {sig.get('ml_levels', [])}")
 
-    # Pre-schedule Base, ML1, ML2 at absolute times
-    schedule_level_at(base_dt, 0)
-    if current["ml_levels"]:
-        # ML1 (index 0)
-        ml1_dt = resolve_entry_datetime(current["ml_levels"][0], current["anchor"])
-        schedule_level_at(ml1_dt, 1)
-        # ML2 (index 1) if present
-        if len(current["ml_levels"]) > 1:
-            ml2_dt = resolve_entry_datetime(current["ml_levels"][1], current["anchor"])
-            schedule_level_at(ml2_dt, 2)
-
+    asyncio.create_task(schedule_trade(base_dt, None, msg_date.replace(tzinfo=None)))
     return True
 
 async def on_signal(e):
