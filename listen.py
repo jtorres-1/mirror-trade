@@ -1,7 +1,7 @@
 # listen.py — Telegram -> PocketOption with martingale
-# Fix: Schedule ML1 only after Base LOSS, ML2 only after ML1 LOSS (no pre-scheduling drift)
-# Fix: Always reset chain after Base/ML1/ML2 finishes
-# Logic: ML1 only after Base loss, ML2 only after ML1 loss (ML3 disabled)
+# Fix: Cancel future ML tasks if chain resets (stop ghost ML2 after ML1 win)
+# Fix: Only up to ML2, ML3 disabled
+# Core: ML1 only after Base LOSS, ML2 only after ML1 LOSS
 
 import os, re, csv, asyncio, sys, requests
 from datetime import datetime, timedelta, timezone
@@ -26,7 +26,7 @@ base_amount = float(os.getenv("TRADE_AMOUNT", "1"))
 mg_mult = float(os.getenv("MARTINGALE_MULT", "2.2"))
 MAX_STAKE = float(os.getenv("MAX_STAKE", "10.65"))
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
-SKEW_MS = int(os.getenv("SKEW_MS", "2200"))  # ~1800–2500 ms usually best
+SKEW_MS = int(os.getenv("SKEW_MS", "2200"))
 
 if not api_id or not api_hash:
     print("[FATAL] API_ID/API_HASH missing in .env"); sys.exit(1)
@@ -108,7 +108,6 @@ def parse_signal(text: str) -> Optional[Dict]:
 
 # --- Time handling ---
 def resolve_entry_datetime(hhmm: str, msg_date_utc: datetime) -> datetime:
-    """Resolve ET hh:mm to proper UTC datetime using msg_date as anchor"""
     hh, mm = map(int, hhmm.split(":"))
     msg_et = msg_date_utc + timedelta(minutes=tz_offset_minutes)
     candidate = msg_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
@@ -142,15 +141,23 @@ daily_pnl = 0.0
 halted_for_day = False
 executor_busy = False
 
-# --- Utilities ---
+# --- New: Track scheduled ML tasks ---
+scheduled_tasks = []
+
 def reset_chain():
-    global current
+    global current, scheduled_tasks
+    # cancel any scheduled ML tasks
+    for t in scheduled_tasks:
+        if not t.done():
+            t.cancel()
+    scheduled_tasks = []
+    # clear trade state
     current.update({
         "active": False, "pair": None, "direction": None,
         "expiry_min": 5, "ml_levels": [],
         "amount": base_amount, "anchor": None
     })
-    print("[RESET] Chain cleared → active=False")
+    print("[RESET] Chain cleared → active=False (all pending ML tasks canceled)")
 
 # --- Core trade execution ---
 async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None, anchor_date=None) -> bool:
@@ -209,11 +216,13 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None, anch
         if ml_label is None:  # base loss
             if current["ml_levels"]:
                 next_t = resolve_entry_datetime(current["ml_levels"][0], anchor_date)
-                asyncio.create_task(schedule_trade(next_t, 1, anchor_date))
+                task = asyncio.create_task(schedule_trade(next_t, 1, anchor_date))
+                scheduled_tasks.append(task)
         elif ml_label == 1:  # ML1 loss
             if len(current["ml_levels"]) > 1:
                 next_t = resolve_entry_datetime(current["ml_levels"][1], anchor_date)
-                asyncio.create_task(schedule_trade(next_t, 2, anchor_date))
+                task = asyncio.create_task(schedule_trade(next_t, 2, anchor_date))
+                scheduled_tasks.append(task)
         else:  # ML2 loss ends chain
             print("[RESET] ML2 LOSS → reset chain.")
             reset_chain()
@@ -269,7 +278,8 @@ async def handle_signal_from_text(text: str, msg_date=None):
     last_signal_utc = now_utc
     print(f"[SIGNAL] {pair} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} | ML {sig.get('ml_levels', [])}")
 
-    asyncio.create_task(schedule_trade(base_dt, None, msg_date.replace(tzinfo=None)))
+    task = asyncio.create_task(schedule_trade(base_dt, None, msg_date.replace(tzinfo=None)))
+    scheduled_tasks.append(task)
     return True
 
 async def on_signal(e):
