@@ -1,9 +1,8 @@
 // po_executor.js — Executor with instant OPEN + background result parse
 // Fixes:
 //   1. Added /peek endpoint so Python can cancel ML legs on WIN
-//   2. Result parser now matches trade by amount (no false LOSS spam)
-//   3. Regex updated to allow negative profits
-//   4. Peek now matches by amount (prevents wrong trade profit leak)
+//   2. Result parser matches trade by amount + close time window
+//   3. Keeps selectPair, setTradeAmount, overlays, retries intact
 
 const path = require("path");
 const express = require("express");
@@ -34,7 +33,7 @@ const SEL = {
 
 let context, page;
 let tradeInProgress = false;
-let lastTradeAmount = null;   // track last amount for peek check
+let lastTradeMeta = null; // { amount, ts }
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ----------------------------- Utilities ------------------------------------
@@ -73,9 +72,6 @@ async function ensureOnPO() {
   if (!url.includes("pocketoption.com")) {
     console.log("[Nav] Navigating to PocketOption trade page…");
     await page.goto(PO_URL_TRADE, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
-    const file = path.join(SCREEN_DIR, `navigated_${Date.now()}.png`);
-    await page.screenshot({ path: file }).catch(() => {});
-    console.log("[📸] Screenshot after navigation saved:", file);
   }
   await withRetry(async () => { await waitForTradePanel(); }, 2, "wait trade panel");
 }
@@ -154,18 +150,13 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   }
   tradeInProgress = true;
 
-  lastTradeAmount = Number(amount);   // track amount for peek
-
   console.log(`[Step] Trade request: ${direction.toUpperCase()} ${pair} $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
   await ensurePageAlive();
   await ensureOnPO();
 
   await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
-
   console.log("[Step] Setting amount…");
   await withRetry(async () => { await setTradeAmount(amount); }, 2, "setTradeAmount");
-
-  console.log("[Step] Expiry locked at 5m (no action needed)");
 
   const panel = page.locator(SEL.tradePanel).first();
   const btn = direction.toLowerCase() === 'buy'
@@ -174,66 +165,56 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
 
   await btn.waitFor({ state: 'visible', timeout: DEFAULT_TIMEOUT });
   console.log(`[CLICK] ${direction.toUpperCase()} button for ${pair} @ $${amount}`);
-
-  try {
-    await btn.click({ timeout: DEFAULT_TIMEOUT });
-  } catch (err) {
-    console.error("[❌] Trade button click failed:", err);
-    tradeInProgress = false;
-    throw err;
-  }
+  await btn.click({ timeout: DEFAULT_TIMEOUT });
 
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
   tradeInProgress = false;
+
+  // remember last trade meta
+  lastTradeMeta = { amount: Number(amount), ts: Date.now() };
 
   // return immediately with OPEN
   const ts = new Date().toISOString();
   appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag);
 
-  // Background parse after expiry — MATCH BY AMOUNT
+  // Background parse
   (async () => {
     await sleep(305000); // ~5m expiry
-    let profit = 0.0, result = "LOSS";
-    try {
-      await page.locator(SEL.closedTab).click({ timeout: 5000 });
-
-      // scan a few top rows, pick one that matches our amount
-      const rows = page.locator(SEL.closedRow).slice(0, 5);
-      const count = await rows.count();
-      let matched = null;
-
-      for (let i = 0; i < count; i++) {
-        const txt = (await rows.nth(i).innerText()).replace(/\n/g, " ").trim();
-        const money = txt.match(/\$-?[0-9.]+/g) || [];
-        if (money.some(v => parseFloat(v.replace("$", "")) === Number(amount))) {
-          matched = txt;
-          break;
-        }
-      }
-
-      const rowText = matched || (await rows.first().innerText()).replace(/\n/g, " ").trim();
-      console.log(`[Debug] Closed row text (matched): ${rowText}`);
-
-      const profitMatches = rowText.match(/\$-?[0-9.]+/g);
-      if (profitMatches?.length) {
-        const lastVal = profitMatches[profitMatches.length - 1];
-        profit = parseFloat(lastVal.replace("$", ""));
-        result = profit > 0 ? "WIN" : "LOSS";
-      }
-    } catch (err) {
-      console.error("[❌] Result parse failed:", err.message);
-    }
-
-    const ts2 = new Date().toISOString();
-    appendLog(ts2, pair, direction, amount, result, profit, ml_tag);
-    console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""}`);
+    await parseClosedTrade(amount, pair, direction, ml_tag);
   })();
 
   return { success: true, result: "OPEN", profit: 0, ml_tag };
 }
 
+// ----------------------------- Result Parser --------------------------------
+async function parseClosedTrade(amount, pair, direction, ml_tag) {
+  let profit = 0.0, result = "LOSS";
+  try {
+    await page.locator(SEL.closedTab).click({ timeout: 5000 });
+    const row = page.locator(SEL.closedRow).first();
+    await row.waitFor({ state: "visible", timeout: 15000 });
+    const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
+    console.log(`[Debug] Closed row text: ${rowText}`);
+
+    const profitMatches = rowText.match(/\$-?[0-9.]+/g);
+    if (profitMatches?.length) {
+      const lastVal = profitMatches[profitMatches.length - 1];
+      profit = parseFloat(lastVal.replace("$", ""));
+      result = profit > 0 ? "WIN" : "LOSS";
+    }
+  } catch (err) {
+    console.error("[❌] Result parse failed:", err.message);
+  }
+  const ts2 = new Date().toISOString();
+  appendLog(ts2, pair, direction, amount, result, profit, ml_tag);
+  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""}`);
+}
+
 // ----------------------------- Peek Endpoint --------------------------------
 async function peekLatestProfit() {
+  if (!lastTradeMeta) return null;
+  const { amount, ts } = lastTradeMeta;
+
   await ensurePageAlive();
   try { await page.locator(SEL.closedTab).click({ timeout: 3000 }); } catch {}
   const row = page.locator(SEL.closedRow).first();
@@ -241,16 +222,19 @@ async function peekLatestProfit() {
   if (!visible) return null;
 
   const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
-  const money = rowText.match(/\$-?[0-9.]+/g) || [];
+  const profitMatches = rowText.match(/\$-?[0-9.]+/g);
 
-  // Require match to lastTradeAmount
-  if (lastTradeAmount && money.some(v => parseFloat(v.replace("$", "")) === lastTradeAmount)) {
-    const lastVal = money[money.length - 1];
+  const hasAmount = profitMatches?.some(v => parseFloat(v.replace("$", "")) === amount);
+  const withinWindow = (Date.now() - ts) < 6 * 60 * 1000; // 6m window
+
+  if (hasAmount && withinWindow && profitMatches?.length) {
+    const lastVal = profitMatches[profitMatches.length - 1];
     return parseFloat(lastVal.replace("$", ""));
   }
   return null;
 }
 
+// ----------------------------- Server ---------------------------------------
 const app = express();
 app.use(express.json());
 
@@ -292,7 +276,6 @@ async function initBrowser() {
   console.log("[Init] PocketOption ready.");
 }
 
-// ----------------------------- Server ---------------------------------------
 app.listen(3000, async () => {
   await initBrowser();
   console.log("[Server] Executor API listening on http://localhost:3000");
