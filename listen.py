@@ -1,7 +1,8 @@
-# listen.py — Telegram -> PocketOption with martingale (hybrid, no delay, no ghosts)
+# listen.py — Telegram -> PocketOption with martingale (hybrid, staggered ML delays, no ghosts)
 # Strategy:
 #   • Base fires slightly early (SKEW_MS).
-#   • ML1/ML2 fire slightly late (ML_DELAY_MS) to allow Closed tab to update.
+#   • ML1 fires slightly late (ML1_DELAY_MS).
+#   • ML2 fires later (ML2_DELAY_MS) to ensure ML1 closes first.
 #   • Just-in-time guard checks /peek multiple times (short loop).
 #   • On any WIN -> cancel all pending ML tasks and reset chain.
 #   • ML2 is the cap. TTL watchdog frees stuck chains.
@@ -29,7 +30,8 @@ mg_mult     = float(os.getenv("MARTINGALE_MULT", "2.2"))
 MAX_STAKE   = float(os.getenv("MAX_STAKE", "10.65"))
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
 SKEW_MS     = int(os.getenv("SKEW_MS", "2200"))   # Base early fire
-ML_DELAY_MS = int(os.getenv("ML_DELAY_MS", "1000"))  # ML delay after scheduled
+ML1_DELAY_MS = int(os.getenv("ML1_DELAY_MS", "1000"))  # ML1 delay
+ML2_DELAY_MS = int(os.getenv("ML2_DELAY_MS", "2000"))  # ML2 delay (longer than ML1)
 
 if not api_id or not api_hash:
     print("[FATAL] API_ID/API_HASH missing in .env"); sys.exit(1)
@@ -225,8 +227,12 @@ async def schedule_leg(entry_dt: datetime, ml_label: Optional[int]):
 
     if ml_label is None:  # base
         fire_dt = entry_dt - timedelta(milliseconds=SKEW_MS)
-    else:  # ML legs — delay slightly
-        fire_dt = entry_dt + timedelta(milliseconds=ML_DELAY_MS)
+    elif ml_label == 1:   # ML1
+        fire_dt = entry_dt + timedelta(milliseconds=ML1_DELAY_MS)
+    elif ml_label == 2:   # ML2
+        fire_dt = entry_dt + timedelta(milliseconds=ML2_DELAY_MS)
+    else:
+        fire_dt = entry_dt
 
     now = datetime.utcnow()
     delay = max(0.0, (fire_dt - now).total_seconds())
