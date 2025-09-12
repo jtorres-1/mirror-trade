@@ -3,6 +3,7 @@
 //   1. Added /peek endpoint so Python can cancel ML legs on WIN
 //   2. Result parser now matches trade by amount (no false LOSS spam)
 //   3. Regex updated to allow negative profits
+//   4. Peek now matches by amount (prevents wrong trade profit leak)
 
 const path = require("path");
 const express = require("express");
@@ -33,6 +34,7 @@ const SEL = {
 
 let context, page;
 let tradeInProgress = false;
+let lastTradeAmount = null;   // track last amount for peek check
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ----------------------------- Utilities ------------------------------------
@@ -152,6 +154,8 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   }
   tradeInProgress = true;
 
+  lastTradeAmount = Number(amount);   // track amount for peek
+
   console.log(`[Step] Trade request: ${direction.toUpperCase()} ${pair} $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
   await ensurePageAlive();
   await ensureOnPO();
@@ -237,9 +241,11 @@ async function peekLatestProfit() {
   if (!visible) return null;
 
   const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
-  const profitMatches = rowText.match(/\$-?[0-9.]+/g);
-  if (profitMatches?.length) {
-    const lastVal = profitMatches[profitMatches.length - 1];
+  const money = rowText.match(/\$-?[0-9.]+/g) || [];
+
+  // Require match to lastTradeAmount
+  if (lastTradeAmount && money.some(v => parseFloat(v.replace("$", "")) === lastTradeAmount)) {
+    const lastVal = money[money.length - 1];
     return parseFloat(lastVal.replace("$", ""));
   }
   return null;
