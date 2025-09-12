@@ -1,12 +1,10 @@
 # listen.py — Telegram -> PocketOption with martingale (hybrid, no delay, no ghosts)
 # Strategy:
-#   • Pre-schedule Base, ML1, ML2 at signal time (SKEW_MS early fire).
-#   • Right before ML1/ML2 fires, do a just-in-time guard:
-#       - Try quick PO "Closed" peek via Node (/peek) to see if last closed trade was WIN.
-#       - Fallback: cancel if a channel "WIN" message was seen moments ago.
+#   • Base fires slightly early (SKEW_MS).
+#   • ML1/ML2 fire slightly late (ML_DELAY_MS) to allow Closed tab to update.
+#   • Just-in-time guard checks /peek multiple times (short loop).
 #   • On any WIN -> cancel all pending ML tasks and reset chain.
-#   • ML2 is the cap. After ML2 is placed, chain is freed for next signal.
-#   • TTL watchdog ensures chain is never stuck active across sessions or day rollovers.
+#   • ML2 is the cap. TTL watchdog frees stuck chains.
 
 import os, re, csv, asyncio, sys, requests, emoji
 from datetime import datetime, timedelta, timezone
@@ -30,7 +28,8 @@ base_amount = float(os.getenv("TRADE_AMOUNT", "1"))
 mg_mult     = float(os.getenv("MARTINGALE_MULT", "2.2"))
 MAX_STAKE   = float(os.getenv("MAX_STAKE", "10.65"))
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
-SKEW_MS     = int(os.getenv("SKEW_MS", "2200"))  # fire slightly early
+SKEW_MS     = int(os.getenv("SKEW_MS", "2200"))   # Base early fire
+ML_DELAY_MS = int(os.getenv("ML_DELAY_MS", "1000"))  # ML delay after scheduled
 
 if not api_id or not api_hash:
     print("[FATAL] API_ID/API_HASH missing in .env"); sys.exit(1)
@@ -163,7 +162,6 @@ def force_otc(pair: str) -> str:
     return pair if (not FORCE_OTC or "OTC" in pair.upper()) else f"{pair} OTC"
 
 def executor_trade(pair, amount, direction, ml_tag) -> Dict:
-    """Fire trade immediately via Node executor; returns dict."""
     payload = {"pair": pair, "amount": amount, "direction": direction.lower(), "ml_tag": ml_tag}
     try:
         r = requests.post(f"{PO_URL}/trade", json=payload, timeout=400)
@@ -224,25 +222,31 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
 # Scheduling with just in time cancellation
 async def schedule_leg(entry_dt: datetime, ml_label: Optional[int]):
     label = "BASE" if ml_label is None else f"ML{ml_label}"
-    fire_dt = entry_dt - timedelta(milliseconds=SKEW_MS)
+
+    if ml_label is None:  # base
+        fire_dt = entry_dt - timedelta(milliseconds=SKEW_MS)
+    else:  # ML legs — delay slightly
+        fire_dt = entry_dt + timedelta(milliseconds=ML_DELAY_MS)
+
     now = datetime.utcnow()
     delay = max(0.0, (fire_dt - now).total_seconds())
     print(f"[SCHEDULE] {label} fire={fire_dt} (target={entry_dt}) delay={delay:.3f}s")
+
     try:
-        wake_early = max(0.0, delay - 0.9)
-        await asyncio.sleep(wake_early)
+        await asyncio.sleep(delay)
+
         if ml_label in (1, 2):
-            p = quick_peek_profit()
-            if p is not None and p > 0:
-                reset_chain(f"{label} cancelled: previous leg WIN via /peek (profit {p})")
-                return
-            if p is None and recent_win_ping(8):
-                reset_chain(f"{label} cancelled: WIN ping from channel")
-                return
-        now2 = datetime.utcnow()
-        rem = max(0.0, (fire_dt - now2).total_seconds())
-        if rem:
-            await asyncio.sleep(rem)
+            # Poll guard a few times quickly before firing
+            for _ in range(5):
+                p = quick_peek_profit()
+                if p is not None and p > 0:
+                    reset_chain(f"{label} cancelled: previous leg WIN via /peek (profit {p})")
+                    return
+                if p is None and recent_win_ping(8):
+                    reset_chain(f"{label} cancelled: WIN ping from channel")
+                    return
+                await asyncio.sleep(0.25)
+
         amt = base_amount if ml_label is None else min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
         await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=ml_label)
     except asyncio.CancelledError:
