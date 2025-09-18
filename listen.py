@@ -96,7 +96,7 @@ def parse_signal(text: str) -> Optional[Dict]:
             if m: d["entry_time"] = m.group(1)
 
     if d["expiry_min"] is None:
-        d["expiry_min"] = 1
+        d["expiry_min"] = 5
 
     if d["pair"] and d["direction"] and d["entry_time"]:
         return d
@@ -116,7 +116,7 @@ def et_day_key() -> str:
 
 # Trade state
 current = {
-    "active": False, "pair": None, "direction": None, "expiry_min": 1,
+    "active": False, "pair": None, "direction": None, "expiry_min": 5,
     "amount": base_amount, "anchor": None
 }
 last_signal_utc: Optional[datetime] = None
