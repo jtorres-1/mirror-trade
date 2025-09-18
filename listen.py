@@ -295,6 +295,12 @@ async def handle_signal_from_text(text: str, msg_date=None):
     now_utc = datetime.utcnow()
     if last_signal_utc and (now_utc - last_signal_utc).total_seconds() < 60:
         print("[INFO] Rapid signal ignored."); return True
+
+    # NEW GUARD: skip if unresolved trade still open
+    if quick_peek_profit() == 0:
+        print("[GUARD] Skipping new BASE: unresolved trade still open on PocketOption.")
+        return True
+
     if current["active"]:
         print("[INFO] Chain active; ignoring new signal."); return True
     pair = force_otc(sig["pair"])
