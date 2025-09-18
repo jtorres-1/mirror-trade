@@ -6,6 +6,7 @@
 //   4. forceCloseOverlays handles both asset dropdowns + Magnific popups
 //   5. Screenshot on failed clicks for instant debugging
 //   6. Screenshot on selectPair failure for instant debugging
+//   7. Hard overlay nuke (div.mfp-bg, div.mfp-wrap) before selecting pair
 
 const path = require("path");
 const express = require("express");
@@ -139,6 +140,12 @@ async function selectPair(pair) {
   }
 
   try {
+    // HARD NUKE of overlays before click
+    await page.evaluate(() => {
+      document.querySelectorAll("div.mfp-bg, div.mfp-wrap").forEach(el => el.remove());
+    }).catch(() => {});
+    await forceCloseOverlays();
+
     await withRetry(async () => {
       await toggle.click({ timeout: DEFAULT_TIMEOUT });
       await page.waitForSelector(SEL.assetOverlay, { state: 'visible', timeout: DEFAULT_TIMEOUT });
@@ -193,7 +200,6 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
 
   await forceCloseOverlays();
 
-  // Wrap selectPair with screenshot on failure
   try {
     await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
   } catch (err) {
