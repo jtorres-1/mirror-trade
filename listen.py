@@ -24,14 +24,11 @@ MAX_STAKE       = float(os.getenv("MAX_STAKE", "10.65"))
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
 
 # Base “early” skew to fight chat/API drift
-SKEW_MS       = int(os.getenv("SKEW_MS", "4200"))  # fire a ~few s before posted entry
+SKEW_MS       = int(os.getenv("SKEW_MS", "4200"))
 
-# Anchored gaps (after close → next leg). Your targets: ML1=3s, ML2=2s
+# Anchored gaps (after close → next leg)
 ML1_GAP_S     = float(os.getenv("ML1_GAP_S", "2"))
 ML2_GAP_S     = float(os.getenv("ML2_GAP_S", "2"))
-
-# Legacy knobs kept for compatibility (ignored if *_GAP_S provided)
-
 
 if not api_id or not api_hash:
     print("[FATAL] API_ID/API_HASH missing in .env"); sys.exit(1)
@@ -95,7 +92,7 @@ def parse_signal(text: str) -> Optional[Dict]:
             if m: d["entry_time"] = m.group(1)
 
     if d["expiry_min"] is None:
-        d["expiry_min"] = 5  # your sessions are M5
+        d["expiry_min"] = 5
 
     if d["pair"] and d["direction"] and d["entry_time"]:
         return d
@@ -117,8 +114,8 @@ def et_day_key() -> str:
 current = {
     "active": False, "pair": None, "direction": None, "expiry_min": 5,
     "amount": base_amount,
-    "base_exec_at": None,     # when base actually executed
-    "ml1_exec_at": None       # when ML1 actually executed
+    "base_exec_at": None,
+    "ml1_exec_at": None
 }
 last_signal_utc: Optional[datetime] = None
 seen_ids = set()
@@ -150,7 +147,6 @@ def cancel_all_tasks():
     scheduled_tasks = []
 
 def arm_ttl(until_dt: datetime, why: str):
-    """Refresh TTL so chain only dies after the *current* leg window ends."""
     global ttl_task
     cancel_task(ttl_task)
     async def _ttl(deadline_dt: datetime):
@@ -229,33 +225,29 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
         log_trade(clean_pair, direction, expiry_min, amount, result, profit, ml_tag)
         print(f"[API] Fired: {direction} {clean_pair} ${amount} [{ml_tag}] → {result}")
 
-        exec_time = datetime.utcnow()  # approximate “actual” execute timestamp
+        exec_time = datetime.utcnow()
 
-        # ── Anchor next legs off the real execution time ──
         if ml_label is None:
             current["base_exec_at"] = exec_time
             base_close = exec_time + timedelta(minutes=expiry_min)
-            # ML1 gap target (seconds). Fallback to legacy ms if GAP not provided.
-            gap1 = ML1_GAP_S if ML1_GAP_S is not None else max(0.7, ML1_DELAY_MS/1000.0)
+            gap1 = ML1_GAP_S if ML1_GAP_S is not None else 3
             ml1_fire = base_close + timedelta(seconds=gap1)
-            # (Re)schedule ML1 now; cancel any old placeholder
             cancel_task(ml1_task)
-            ml1_task = asyncio.create_task(schedule_leg(ml1_fire, 1))
+            ml1_task = asyncio.create_task(schedule_leg(ml1_fire, 1, base_close))
             print(f"[CHAIN] ML1 anchored → {ml1_fire} (gap {gap1:.2f}s after base close)")
             arm_ttl(base_close + timedelta(minutes=expiry_min, seconds=30), "base->ml1 span")
 
         elif ml_label == 1:
             current["ml1_exec_at"] = exec_time
             ml1_close = exec_time + timedelta(minutes=expiry_min)
-            gap2 = ML2_GAP_S if ML2_GAP_S is not None else max(0.7, ML2_DELAY_MS/1000.0)
+            gap2 = ML2_GAP_S if ML2_GAP_S is not None else 2
             ml2_fire = ml1_close + timedelta(seconds=gap2)
             cancel_task(ml2_task)
-            ml2_task = asyncio.create_task(schedule_leg(ml2_fire, 2))
+            ml2_task = asyncio.create_task(schedule_leg(ml2_fire, 2, ml1_close))
             print(f"[CHAIN] ML2 anchored → {ml2_fire} (gap {gap2:.2f}s after ML1 close)")
             arm_ttl(ml1_close + timedelta(minutes=expiry_min, seconds=30), "ml1->ml2 span")
 
         elif ml_label == 2:
-            # After ML2 fires we let TTL close shortly after its close time
             ml2_close = exec_time + timedelta(minutes=expiry_min)
             arm_ttl(ml2_close + timedelta(seconds=30), "ml2 close")
     finally:
@@ -266,7 +258,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
         reset_chain("ML2 placed; chain released.")
 
 # ── Scheduling (with just-in-time win guards) ─────────────────────────────────
-async def schedule_leg(fire_dt: datetime, ml_label: Optional[int]):
+async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: Optional[datetime] = None):
     label = "BASE" if ml_label is None else f"ML{ml_label}"
     delay = max(0.0, (fire_dt - datetime.utcnow()).total_seconds())
     print(f"[SCHEDULE] {label} fire={fire_dt} delay={delay:.3f}s")
@@ -274,10 +266,13 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int]):
     try:
         await asyncio.sleep(delay)
 
-        # keep guard lean so gaps stay <= ~5s
         if ml_label in (1, 2):
-            # ~2s guard window + last instant peek
-            for _ in range(8):  # 8 * 0.25s = 2s
+            # only start checking after prev_close has actually passed
+            if prev_close:
+                while datetime.utcnow() < prev_close:
+                    await asyncio.sleep(0.25)
+
+            for _ in range(8):
                 ok, p = quick_peek()
                 if ok and p > 0:
                     reset_chain(f"{label} cancelled: WIN via /peek (profit {p})")
@@ -330,7 +325,6 @@ async def handle_signal_from_text(text: str, msg_date=None):
         print("[INFO] Rapid signal ignored.")
         return True
 
-    # Guard: block base if unresolved open trade exists
     should_block = True
     for _ in range(6):
         ok, p = quick_peek()
@@ -363,11 +357,9 @@ async def handle_signal_from_text(text: str, msg_date=None):
     cancel_task(ml1_task); ml1_task = None
     cancel_task(ml2_task); ml2_task = None
 
-    # Schedule ONLY base now. ML1/ML2 will be anchored after we know actual exec times.
     base_fire = base_dt - timedelta(milliseconds=SKEW_MS)
     t0 = asyncio.create_task(schedule_leg(base_fire, None)); scheduled_tasks.append(t0)
 
-    # TTL: give base window (entry->close) some slack
     arm_ttl(base_fire + timedelta(minutes=current["expiry_min"], seconds=45), "base window")
     return True
 
