@@ -127,6 +127,7 @@ async function setTradeAmount(amount) {
   await page.keyboard.type(String(amount)).catch(() => {});
 }
 
+// ----------------------------- Patched selectPair ---------------------------
 async function selectPair(pair) {
   const toggle = page.locator(SEL.symbolToggle).first();
   let current = "";
@@ -137,24 +138,37 @@ async function selectPair(pair) {
     return;
   }
 
-  await withRetry(async () => {
-    await toggle.click({ timeout: DEFAULT_TIMEOUT });
-    await page.waitForSelector(SEL.assetOverlay, { state: 'visible', timeout: DEFAULT_TIMEOUT });
-  }, 2, "open asset overlay");
+  try {
+    await withRetry(async () => {
+      await toggle.click({ timeout: DEFAULT_TIMEOUT });
+      await page.waitForSelector(SEL.assetOverlay, { state: 'visible', timeout: DEFAULT_TIMEOUT });
+    }, 2, "open asset overlay");
 
-  const cleaned = pair.replace(" OTC", "").replace("/", "").toLowerCase();
-  const search = page.locator(SEL.searchInput).first();
-  await search.fill("");
-  await search.type(cleaned, { delay: 30 }).catch(() => {});
-  await sleep(250);
+    const cleaned = pair.replace(" OTC", "").replace("/", "").toLowerCase();
+    const search = page.locator(SEL.searchInput).first();
+    await search.fill("");
+    await search.type(cleaned, { delay: 30 }).catch(() => {});
+    await sleep(250);
 
-  const listItem = page.locator('.alist__label', { hasText: pair }).first();
-  await withRetry(async () => { await listItem.click({ timeout: DEFAULT_TIMEOUT }); }, 2, "select list item");
+    const listItem = page.locator('.alist__label', { hasText: pair }).first();
+    await withRetry(async () => { await listItem.click({ timeout: DEFAULT_TIMEOUT }); }, 2, "select list item");
 
-  console.log(`[Step] Selected pair: ${pair}`);
-  await page.keyboard.press('Escape').catch(() => {});
-  await forceCloseOverlays();
-  await sleep(150);
+    console.log(`[Step] Selected pair: ${pair}`);
+    await page.keyboard.press('Escape').catch(() => {});
+    await forceCloseOverlays();
+    await sleep(150);
+
+  } catch (err) {
+    const ts = Date.now();
+    const screenshotPath = path.join(SCREEN_DIR, `selectPair_fail_${pair}_${ts}.png`);
+    try {
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      console.log(`[📸] Saved screenshot on selectPair fail: ${screenshotPath}`);
+    } catch (ssErr) {
+      console.error("[❌] Screenshot failed:", ssErr.message);
+    }
+    throw err;
+  }
 }
 
 function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "") {
