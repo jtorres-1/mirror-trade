@@ -60,33 +60,22 @@ async function waitForTradePanel() {
 }
 
 async function forceCloseOverlays() {
-  for (let i = 0; i < 3; i++) {
-    let closed = false;
+  try {
+    // Hard nuke — instant removal
+    await page.evaluate(() => {
+      document.querySelectorAll("div.mfp-bg, div.mfp-wrap, .drop-down-modal-wrap.active").forEach(el => el.remove());
+    }).catch(() => {});
 
-    const assetOverlay = page.locator(SEL.assetOverlay).first();
-    if (await assetOverlay.isVisible().catch(() => false)) {
-      try {
-        await page.keyboard.press("Escape");
-        await sleep(100);
-        closed = true;
-      } catch {}
+    // Safety: if still visible after 1s, reload
+    await sleep(1000);
+    const stillVisible = await page.locator("div.mfp-wrap, .drop-down-modal-wrap.active").first().isVisible().catch(() => false);
+    if (stillVisible) {
+      console.log("[Heal] Overlay stuck — reloading page");
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+      await ensureOnPO();
     }
-
-    const popup = page.locator("div.mfp-wrap").first();
-    if (await popup.isVisible().catch(() => false)) {
-      console.log("[Executor] Blocking popup detected — closing...");
-      try {
-        await page.click("button.mfp-close").catch(async () => {
-          await page.evaluate(() => {
-            document.querySelectorAll("div.mfp-wrap").forEach(el => el.remove());
-          });
-        });
-        await sleep(200);
-        closed = true;
-      } catch {}
-    }
-
-    if (!closed) break;
+  } catch (err) {
+    console.error("[Overlay] Force close failed:", err.message);
   }
 }
 
