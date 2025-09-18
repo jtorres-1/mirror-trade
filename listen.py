@@ -242,8 +242,8 @@ async def schedule_leg(entry_dt: datetime, ml_label: Optional[int]):
         await asyncio.sleep(delay)
 
         if ml_label in (1, 2):
-            # Poll guard a few times quickly before firing
-            for _ in range(5):
+            # Poll guard ~2.5s total before firing
+            for _ in range(10):
                 p = quick_peek_profit()
                 if p is not None and p > 0:
                     reset_chain(f"{label} cancelled: previous leg WIN via /peek (profit {p})")
