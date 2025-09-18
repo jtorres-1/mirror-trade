@@ -328,6 +328,10 @@ async def on_signal(e):
     username = getattr(getattr(e, "chat", None), "username", None)
     print(f"[TG DEBUG] Incoming from: '{src}' (@{username})")
     text = (e.message.message or "").strip()
+
+    # 🔴 DEBUG LINE ADDED
+    print("[TG FULL RAW]", repr(text))
+
     print("[TG RAW]", text.replace("\n"," | ")[:500])
     ok = await handle_signal_from_text(text, msg_date=e.message.date)
     if not ok:
