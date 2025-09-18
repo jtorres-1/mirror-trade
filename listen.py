@@ -23,10 +23,8 @@ mg_mult         = float(os.getenv("MARTINGALE_MULT", "2.2"))
 MAX_STAKE       = float(os.getenv("MAX_STAKE", "10.65"))
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
 
-# Base “early” skew to fight chat/API drift
 SKEW_MS       = int(os.getenv("SKEW_MS", "4200"))
 
-# Anchored gaps (after close → next leg)
 ML1_GAP_S     = float(os.getenv("ML1_GAP_S", "2"))
 ML2_GAP_S     = float(os.getenv("ML2_GAP_S", "2"))
 
@@ -37,10 +35,8 @@ if not channel:
 if channel and not channel.startswith("@"):
     channel = "@" + channel
 
-# ── Telegram client ────────────────────────────────────────────────────────────
 client = TelegramClient(session_name, api_id, api_hash)
 
-# ── Logging ────────────────────────────────────────────────────────────────────
 LOG_FILE = "trade_log.csv"
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", newline="") as f:
@@ -54,7 +50,6 @@ def log_trade(pair, direction, expiry_min, amount, result, profit, ml_tag=""):
             datetime.utcnow().isoformat(), pair, direction, expiry_min, amount, result, profit, ml_tag
         ])
 
-# ── Parsing ────────────────────────────────────────────────────────────────────
 PAIR_RE = re.compile(r'([A-Z]{3}/[A-Z]{3})', re.I)
 TIME_RE = re.compile(r'(\d{1,2}:\d{2})')
 MIN_RE  = re.compile(r'(\d+)\s*m', re.I)
@@ -98,7 +93,6 @@ def parse_signal(text: str) -> Optional[Dict]:
         return d
     return None
 
-# ── Time helpers ───────────────────────────────────────────────────────────────
 def resolve_entry_datetime(hhmm: str, msg_date_utc: datetime) -> datetime:
     hh, mm = map(int, hhmm.split(":"))
     et = msg_date_utc + timedelta(minutes=tz_offset_minutes)
@@ -110,7 +104,6 @@ def et_day_key() -> str:
     now_et = now_utc + timedelta(minutes=tz_offset_minutes)
     return now_et.strftime("%Y-%m-%d")
 
-# ── State ──────────────────────────────────────────────────────────────────────
 current = {
     "active": False, "pair": None, "direction": None, "expiry_min": 5,
     "amount": base_amount,
@@ -124,7 +117,6 @@ daily_pnl = 0.0
 halted_for_day = False
 executor_busy = False
 
-# task handles
 scheduled_tasks = []
 ttl_task = None
 ml1_task = None
@@ -170,7 +162,6 @@ def reset_chain(reason=""):
     if reason: print(f"[RESET] {reason}")
     else:      print("[RESET] Chain cleared.")
 
-# ── Guards (/peek + win ping) ──────────────────────────────────────────────────
 last_win_ping_utc: Optional[datetime] = None
 WIN_HINT_RE = re.compile(r'\bWIN\b|\bVICTORY\b', re.I)
 
@@ -189,7 +180,6 @@ def quick_peek() -> (bool, float):
         pass
     return False, 0.0
 
-# ── Executor bridge ────────────────────────────────────────────────────────────
 def executor_trade(pair, amount, direction, ml_tag) -> Dict:
     payload = {"pair": pair, "amount": amount, "direction": direction.lower(), "ml_tag": ml_tag}
     try:
@@ -202,7 +192,6 @@ def executor_trade(pair, amount, direction, ml_tag) -> Dict:
         print(f"[API EXCEPTION] {e}")
     return {"success": False, "result": "OPEN", "profit": 0}
 
-# ── Core trade execution ───────────────────────────────────────────────────────
 async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> None:
     global executor_busy, daily_pnl, halted_for_day, ml1_task, ml2_task
     if DAILY_STOP_LOSS > 0 and daily_pnl <= -DAILY_STOP_LOSS:
@@ -257,7 +246,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
         print("[DONE] ML2 placed. Freeing chain for next signal.")
         reset_chain("ML2 placed; chain released.")
 
-# ── Scheduling (with just-in-time win guards) ─────────────────────────────────
+# ── Scheduling ────────────────────────────────────────────────────────────────
 async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: Optional[datetime] = None):
     label = "BASE" if ml_label is None else f"ML{ml_label}"
     delay = max(0.0, (fire_dt - datetime.utcnow()).total_seconds())
@@ -267,12 +256,13 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
         await asyncio.sleep(delay)
 
         if ml_label in (1, 2):
-            # only start checking after prev_close has actually passed
             if prev_close:
                 while datetime.utcnow() < prev_close:
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(0.1)  # finer wait
 
-            for _ in range(8):
+            # dynamic guard loop — break as soon as result known
+            start = datetime.utcnow()
+            while (datetime.utcnow() - start).total_seconds() < 2.0:
                 ok, p = quick_peek()
                 if ok and p > 0:
                     reset_chain(f"{label} cancelled: WIN via /peek (profit {p})")
@@ -280,7 +270,8 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
                 if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6:
                     reset_chain(f"{label} cancelled: WIN ping")
                     return
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.2)
+            # final last-sec peek
             ok, p = quick_peek()
             if ok and p > 0:
                 reset_chain(f"{label} cancelled last-sec: WIN via /peek (profit {p})")
@@ -292,7 +283,6 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
         print(f"[CANCEL] {label} cancelled.")
         return
 
-# ── Signal handling ───────────────────────────────────────────────────────────
 async def handle_signal_from_text(text: str, msg_date=None):
     global last_signal_utc, daily_pnl, halted_for_day, current, scheduled_tasks, last_win_ping_utc, ml1_task, ml2_task
     if WIN_HINT_RE.search(text):
@@ -363,7 +353,6 @@ async def handle_signal_from_text(text: str, msg_date=None):
     arm_ttl(base_fire + timedelta(minutes=current["expiry_min"], seconds=45), "base window")
     return True
 
-# ── Telegram event wrapper ─────────────────────────────────────────────────────
 async def on_signal(e):
     if e.message.id in seen_ids:
         return
@@ -377,7 +366,6 @@ async def on_signal(e):
     if not ok:
         print("[TG DEBUG] Ignored: no valid trading signal")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
     print("[DEBUG] Starting Telegram client...")
     await client.connect()
