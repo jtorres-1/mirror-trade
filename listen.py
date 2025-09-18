@@ -163,6 +163,26 @@ PO_URL = "http://localhost:3000"
 def force_otc(pair: str) -> str:
     return pair if (not FORCE_OTC or "OTC" in pair.upper()) else f"{pair} OTC"
 
+# ---------- /peek helper (new: return (ok, profit)) ----------
+def quick_peek() -> (bool, float):
+    """
+    Returns:
+      (ok, profit)
+      ok=True  -> /peek matched the latest trade (within window)
+                  profit can be +, 0, or - (0 means unresolved/ambiguous)
+      ok=False -> /peek had no confident match (no blocking condition)
+    """
+    try:
+        r = requests.get(f"{PO_URL}/peek", timeout=1.5)
+        if r.status_code == 200:
+            j = r.json()
+            ok = bool(j.get("ok", False))
+            profit = float(j.get("profit", 0.0))
+            return ok, profit
+    except Exception:
+        pass
+    return False, 0.0
+
 def executor_trade(pair, amount, direction, ml_tag) -> Dict:
     payload = {"pair": pair, "amount": amount, "direction": direction.lower(), "ml_tag": ml_tag}
     try:
@@ -174,21 +194,6 @@ def executor_trade(pair, amount, direction, ml_tag) -> Dict:
     except Exception as e:
         print(f"[API EXCEPTION] {e}")
     return {"success": False, "result": "OPEN", "profit": 0}
-
-def quick_peek_profit() -> Optional[float]:
-    try:
-        r = requests.get(f"{PO_URL}/peek", timeout=2.0)
-        if r.status_code == 200:
-            j = r.json()
-            return float(j.get("profit", 0.0))
-    except Exception:
-        pass
-    return None
-
-def recent_win_ping(threshold_sec=8) -> bool:
-    if not last_win_ping_utc:
-        return False
-    return (datetime.utcnow() - last_win_ping_utc).total_seconds() <= threshold_sec
 
 # Core trade execution
 async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> None:
@@ -242,13 +247,13 @@ async def schedule_leg(entry_dt: datetime, ml_label: Optional[int]):
         await asyncio.sleep(delay)
 
         if ml_label in (1, 2):
-            # Poll guard ~2.5s total before firing
+            # Poll guard ~2.5s total before firing (fast + light)
             for _ in range(10):
-                p = quick_peek_profit()
-                if p is not None and p > 0:
+                ok, p = quick_peek()
+                if ok and p > 0:
                     reset_chain(f"{label} cancelled: previous leg WIN via /peek (profit {p})")
                     return
-                if p is None and recent_win_ping(8):
+                if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 8:
                     reset_chain(f"{label} cancelled: WIN ping from channel")
                     return
                 await asyncio.sleep(0.25)
@@ -296,10 +301,25 @@ async def handle_signal_from_text(text: str, msg_date=None):
     if last_signal_utc and (now_utc - last_signal_utc).total_seconds() < 60:
         print("[INFO] Rapid signal ignored."); return True
 
-    # NEW GUARD: skip if unresolved trade still open
-    if quick_peek_profit() == 0:
+    # ---- NEW GUARD: only block if /peek positively matches an unresolved last trade ----
+    # We poll quickly a few times to avoid a race right after ML1 closes.
+    should_block = True
+    for _ in range(6):  # ~1.2s total
+        ok, p = quick_peek()
+        if not ok:
+            should_block = False  # no active/unsettled match -> do NOT block
+            break
+        if p != 0:
+            # A resolved result (win/loss). If win, remember it (secondary signal for guards).
+            if p > 0:
+                last_win_ping_utc = datetime.utcnow()
+            should_block = False
+            break
+        await asyncio.sleep(0.2)
+    if should_block:
         print("[GUARD] Skipping new BASE: unresolved trade still open on PocketOption.")
         return True
+    # ---- end new guard ----
 
     if current["active"]:
         print("[INFO] Chain active; ignoring new signal."); return True
