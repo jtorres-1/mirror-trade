@@ -5,6 +5,7 @@
 //   3. Keeps selectPair, setTradeAmount, overlays, retries intact
 //   4. forceCloseOverlays handles both asset dropdowns + Magnific popups
 //   5. Screenshot on failed clicks for instant debugging
+//   6. Screenshot on selectPair failure for instant debugging
 
 const path = require("path");
 const express = require("express");
@@ -58,11 +59,9 @@ async function waitForTradePanel() {
 }
 
 async function forceCloseOverlays() {
-  // Try 3 times max
   for (let i = 0; i < 3; i++) {
     let closed = false;
 
-    // 1. Handle PocketOption asset dropdown
     const assetOverlay = page.locator(SEL.assetOverlay).first();
     if (await assetOverlay.isVisible().catch(() => false)) {
       try {
@@ -72,13 +71,11 @@ async function forceCloseOverlays() {
       } catch {}
     }
 
-    // 2. Handle Magnific popups (bonus ads, promos, etc.)
     const popup = page.locator("div.mfp-wrap").first();
     if (await popup.isVisible().catch(() => false)) {
       console.log("[Executor] Blocking popup detected — closing...");
       try {
         await page.click("button.mfp-close").catch(async () => {
-          // fallback: hard remove popup
           await page.evaluate(() => {
             document.querySelectorAll("div.mfp-wrap").forEach(el => el.remove());
           });
@@ -88,7 +85,7 @@ async function forceCloseOverlays() {
       } catch {}
     }
 
-    if (!closed) break; // nothing to close, exit early
+    if (!closed) break;
   }
 }
 
@@ -147,7 +144,7 @@ async function selectPair(pair) {
 
   const cleaned = pair.replace(" OTC", "").replace("/", "").toLowerCase();
   const search = page.locator(SEL.searchInput).first();
-  await search.fill(""); 
+  await search.fill("");
   await search.type(cleaned, { delay: 30 }).catch(() => {});
   await sleep(250);
 
@@ -181,12 +178,27 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   await ensureOnPO();
 
   await forceCloseOverlays();
-  await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
+
+  // Wrap selectPair with screenshot on failure
+  try {
+    await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
+  } catch (err) {
+    const ts = Date.now();
+    const screenshotPath = path.join(SCREEN_DIR, `failed_selectPair_${pair}_${ts}.png`);
+    try {
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      console.log(`[📸] Saved selectPair screenshot: ${screenshotPath}`);
+    } catch (ssErr) {
+      console.error("[❌] Failed to capture selectPair screenshot:", ssErr.message);
+    }
+    tradeInProgress = false;
+    throw err;
+  }
 
   console.log("[Step] Setting amount…");
   await withRetry(async () => { await setTradeAmount(amount); }, 2, "setTradeAmount");
 
-  await forceCloseOverlays(); // 🔴 ensure popup not blocking buttons
+  await forceCloseOverlays();
 
   const panel = page.locator(SEL.tradePanel).first();
   const btn = direction.toLowerCase() === 'buy'
@@ -201,8 +213,6 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
     await btn.click({ timeout: DEFAULT_TIMEOUT, force: true });
   } catch (err) {
     console.error("[❌] Button click failed:", err.message);
-
-    // Save screenshot for debugging
     const ts = Date.now();
     const screenshotPath = path.join(SCREEN_DIR, `failed_click_${pair}_${direction}_${ts}.png`);
     try {
@@ -211,7 +221,6 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
     } catch (ssErr) {
       console.error("[❌] Failed to capture screenshot:", ssErr.message);
     }
-
     tradeInProgress = false;
     throw err;
   }
@@ -219,16 +228,13 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
   tradeInProgress = false;
 
-  // remember last trade meta
   lastTradeMeta = { amount: Number(amount), ts: Date.now() };
 
-  // return immediately with OPEN
   const ts = new Date().toISOString();
   appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag);
 
-  // Background parse
   (async () => {
-    await sleep(305000); // ~5m expiry
+    await sleep(305000);
     await parseClosedTrade(amount, pair, direction, ml_tag);
   })();
 
@@ -274,7 +280,7 @@ async function peekLatestProfit() {
   const profitMatches = rowText.match(/\$-?[0-9.]+/g);
 
   const hasAmount = profitMatches?.some(v => parseFloat(v.replace("$", "")) === amount);
-  const withinWindow = (Date.now() - ts) < 6 * 60 * 1000; // 6m window
+  const withinWindow = (Date.now() - ts) < 6 * 60 * 1000;
 
   if (hasAmount && withinWindow && profitMatches?.length) {
     const lastVal = profitMatches[profitMatches.length - 1];
