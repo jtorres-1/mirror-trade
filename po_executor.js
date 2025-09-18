@@ -20,14 +20,22 @@ const SCREEN_DIR = path.resolve(__dirname, "screens");
 if (!fs.existsSync(SCREEN_DIR)) fs.mkdirSync(SCREEN_DIR);
 
 const SEL = {
+  // Pair selection
   symbolToggle: 'span.current-symbol.current-symbol_cropped, .current-symbol',
   assetOverlay: '.drop-down-modal-wrap.active',
-  tradePanel: '[id^="put-call-buttons-chart"]',
   searchInput: 'input[placeholder="Search"]',
 
-  buyBtn: '#put-call-buttons-chart-1 a.buy, #put-call-buttons-chart-1 button:has-text("Buy"), a.btn.btn-call',
-  sellBtn: '#put-call-buttons-chart-1 a.sell, #put-call-buttons-chart-1 button:has-text("Sell"), a.btn.btn-put',
+  // Trade panel
+  tradePanel: '#put-call-buttons-chart-1',
 
+  // Buy / Sell buttons (stable text-based selectors from codegen)
+  buyBtn: 'a:has-text("Buy"), button:has-text("Buy")',
+  sellBtn: 'a:has-text("Sell"), button:has-text("Sell")',
+
+  // Popup handling
+  popupClose: '[title="Close"], button.mfp-close',
+
+  // Results
   closedTab: 'li:has-text("Closed")',
   closedRow: '.deals-list__item'
 };
@@ -71,12 +79,12 @@ async function forceCloseOverlays() {
       } catch {}
     }
 
-    // 2. Handle Magnific popups (bonus ads, promos, etc.)
+    // 2. Handle Magnific popups (bonus ads, promos, daily reward, etc.)
     const popup = page.locator("div.mfp-wrap").first();
     if (await popup.isVisible().catch(() => false)) {
       console.log("[Executor] Blocking popup detected — closing...");
       try {
-        await page.click("button.mfp-close").catch(async () => {
+        await page.locator(SEL.popupClose).click().catch(async () => {
           // fallback: hard remove popup
           await page.evaluate(() => {
             document.querySelectorAll("div.mfp-wrap").forEach(el => el.remove());
@@ -192,9 +200,10 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
     ? panel.locator(SEL.buyBtn).first()
     : panel.locator(SEL.sellBtn).first();
 
+  await btn.scrollIntoViewIfNeeded().catch(() => {});
   await btn.waitFor({ state: 'visible', timeout: DEFAULT_TIMEOUT });
   console.log(`[CLICK] ${direction.toUpperCase()} button for ${pair} @ $${amount}`);
-  await btn.click({ timeout: DEFAULT_TIMEOUT });
+  await btn.click({ timeout: DEFAULT_TIMEOUT, force: true });
 
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
   tradeInProgress = false;
