@@ -7,6 +7,7 @@
 //   5. Screenshot on failed clicks for instant debugging
 //   6. Screenshot on selectPair failure for instant debugging
 //   7. Hard overlay nuke (div.mfp-bg, div.mfp-wrap) before selecting pair
+//   8. /trade endpoint responds instantly, runs placeTrade in background (fixes ML delays)
 
 const path = require("path");
 const express = require("express");
@@ -304,19 +305,24 @@ async function peekLatestProfit() {
 const app = express();
 app.use(express.json());
 
-app.post("/trade", async (req, res) => {
+app.post("/trade", (req, res) => {
   console.log("[REQ] Incoming trade request:", req.body);
   const { pair, amount, direction, ml_tag } = req.body || {};
   if (!pair || !amount || !direction) {
     return res.status(400).json({ success: false, error: "pair, amount, direction required" });
   }
-  try {
-    const result = await placeTrade(pair, amount, direction, ml_tag);
-    res.json({ success: true, pair, amount, direction, ...result });
-  } catch (err) {
-    console.error("[❌] Trade failed:", err);
-    res.status(500).json({ success: false, error: err?.message || String(err) });
-  }
+
+  // Respond instantly so Python doesn’t get blocked
+  res.json({ success: true, result: "QUEUED", pair, amount, direction, ml_tag });
+
+  // Run the trade in background
+  (async () => {
+    try {
+      await placeTrade(pair, amount, direction, ml_tag);
+    } catch (err) {
+      console.error("[❌] Background trade failed:", err);
+    }
+  })();
 });
 
 app.get("/peek", async (req, res) => {
