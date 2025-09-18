@@ -27,7 +27,7 @@ DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
 SKEW_MS       = int(os.getenv("SKEW_MS", "4200"))  # fire a ~few s before posted entry
 
 # Anchored gaps (after close → next leg). Your targets: ML1=3s, ML2=2s
-ML1_GAP_S     = float(os.getenv("ML1_GAP_S", "3"))
+ML1_GAP_S     = float(os.getenv("ML1_GAP_S", "2"))
 ML2_GAP_S     = float(os.getenv("ML2_GAP_S", "2"))
 
 # Legacy knobs kept for compatibility (ignored if *_GAP_S provided)
