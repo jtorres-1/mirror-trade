@@ -3,6 +3,7 @@
 //   1. Added /peek endpoint so Python can cancel ML legs on WIN
 //   2. Result parser matches trade by amount + close time window
 //   3. Keeps selectPair, setTradeAmount, overlays, retries intact
+//   4. forceCloseOverlays handles both asset dropdowns + Magnific popups
 
 const path = require("path");
 const express = require("express");
@@ -56,13 +57,37 @@ async function waitForTradePanel() {
 }
 
 async function forceCloseOverlays() {
+  // Try 3 times max
   for (let i = 0; i < 3; i++) {
-    try { await page.keyboard.press('Escape'); } catch {}
-    const overlay = page.locator(SEL.assetOverlay).first();
-    const visible = await overlay.isVisible().catch(() => false);
-    if (!visible) break;
-    try { await page.mouse.click(10, 10); } catch {}
-    await sleep(120);
+    let closed = false;
+
+    // 1. Handle PocketOption asset dropdown
+    const assetOverlay = page.locator(SEL.assetOverlay).first();
+    if (await assetOverlay.isVisible().catch(() => false)) {
+      try {
+        await page.keyboard.press("Escape");
+        await sleep(100);
+        closed = true;
+      } catch {}
+    }
+
+    // 2. Handle Magnific popups (bonus ads, promos, etc.)
+    const popup = page.locator("div.mfp-wrap").first();
+    if (await popup.isVisible().catch(() => false)) {
+      console.log("[Executor] Blocking popup detected — closing...");
+      try {
+        await page.click("button.mfp-close").catch(async () => {
+          // fallback: hard remove popup
+          await page.evaluate(() => {
+            document.querySelectorAll("div.mfp-wrap").forEach(el => el.remove());
+          });
+        });
+        await sleep(200);
+        closed = true;
+      } catch {}
+    }
+
+    if (!closed) break; // nothing to close, exit early
   }
 }
 
@@ -154,9 +179,13 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   await ensurePageAlive();
   await ensureOnPO();
 
+  await forceCloseOverlays();
   await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
+
   console.log("[Step] Setting amount…");
   await withRetry(async () => { await setTradeAmount(amount); }, 2, "setTradeAmount");
+
+  await forceCloseOverlays(); // 🔴 ensure popup not blocking buttons
 
   const panel = page.locator(SEL.tradePanel).first();
   const btn = direction.toLowerCase() === 'buy'
