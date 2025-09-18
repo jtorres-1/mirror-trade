@@ -4,6 +4,7 @@
 //   2. Result parser matches trade by amount + close time window
 //   3. Keeps selectPair, setTradeAmount, overlays, retries intact
 //   4. forceCloseOverlays handles both asset dropdowns + Magnific popups
+//   5. Screenshot on failed clicks for instant debugging
 
 const path = require("path");
 const express = require("express");
@@ -20,22 +21,14 @@ const SCREEN_DIR = path.resolve(__dirname, "screens");
 if (!fs.existsSync(SCREEN_DIR)) fs.mkdirSync(SCREEN_DIR);
 
 const SEL = {
-  // Pair selection
   symbolToggle: 'span.current-symbol.current-symbol_cropped, .current-symbol',
   assetOverlay: '.drop-down-modal-wrap.active',
+  tradePanel: '[id^="put-call-buttons-chart"]',
   searchInput: 'input[placeholder="Search"]',
 
-  // Trade panel
-  tradePanel: '#put-call-buttons-chart-1',
+  buyBtn: '#put-call-buttons-chart-1 a.buy, #put-call-buttons-chart-1 button:has-text("Buy"), a.btn.btn-call',
+  sellBtn: '#put-call-buttons-chart-1 a.sell, #put-call-buttons-chart-1 button:has-text("Sell"), a.btn.btn-put',
 
-  // Buy / Sell buttons (stable text-based selectors from codegen)
-  buyBtn: 'a:has-text("Buy"), button:has-text("Buy")',
-  sellBtn: 'a:has-text("Sell"), button:has-text("Sell")',
-
-  // Popup handling
-  popupClose: '[title="Close"], button.mfp-close',
-
-  // Results
   closedTab: 'li:has-text("Closed")',
   closedRow: '.deals-list__item'
 };
@@ -79,12 +72,12 @@ async function forceCloseOverlays() {
       } catch {}
     }
 
-    // 2. Handle Magnific popups (bonus ads, promos, daily reward, etc.)
+    // 2. Handle Magnific popups (bonus ads, promos, etc.)
     const popup = page.locator("div.mfp-wrap").first();
     if (await popup.isVisible().catch(() => false)) {
       console.log("[Executor] Blocking popup detected — closing...");
       try {
-        await page.locator(SEL.popupClose).click().catch(async () => {
+        await page.click("button.mfp-close").catch(async () => {
           // fallback: hard remove popup
           await page.evaluate(() => {
             document.querySelectorAll("div.mfp-wrap").forEach(el => el.remove());
@@ -203,7 +196,25 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   await btn.scrollIntoViewIfNeeded().catch(() => {});
   await btn.waitFor({ state: 'visible', timeout: DEFAULT_TIMEOUT });
   console.log(`[CLICK] ${direction.toUpperCase()} button for ${pair} @ $${amount}`);
-  await btn.click({ timeout: DEFAULT_TIMEOUT, force: true });
+
+  try {
+    await btn.click({ timeout: DEFAULT_TIMEOUT, force: true });
+  } catch (err) {
+    console.error("[❌] Button click failed:", err.message);
+
+    // Save screenshot for debugging
+    const ts = Date.now();
+    const screenshotPath = path.join(SCREEN_DIR, `failed_click_${pair}_${direction}_${ts}.png`);
+    try {
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      console.log(`[📸] Saved screenshot: ${screenshotPath}`);
+    } catch (ssErr) {
+      console.error("[❌] Failed to capture screenshot:", ssErr.message);
+    }
+
+    tradeInProgress = false;
+    throw err;
+  }
 
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
   tradeInProgress = false;
