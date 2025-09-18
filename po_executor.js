@@ -297,14 +297,16 @@ async function peekLatestProfit() {
   if (!visible) return null;
 
   const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
-  const profitMatches = rowText.match(/\$-?[0-9.]+/g);
+  const dollarVals = (rowText.match(/\$-?[0-9.]+/g) || []).map(s => parseFloat(s.replace("$", "")));
 
-  const hasAmount = profitMatches?.some(v => parseFloat(v.replace("$", "")) === amount);
+  // --- Relaxed amount match: ±max($0.02, 2%) tolerance ---
+  const tol = Math.max(0.02, Number(amount) * 0.02);
+  const hasApproxAmount = dollarVals.some(v => Math.abs(v - Number(amount)) <= tol);
   const withinWindow = (Date.now() - ts) < 6 * 60 * 1000;
 
-  if (hasAmount && withinWindow && profitMatches?.length) {
-    const lastVal = profitMatches[profitMatches.length - 1];
-    return parseFloat(lastVal.replace("$", ""));
+  if (hasApproxAmount && withinWindow && dollarVals.length) {
+    const lastVal = dollarVals[dollarVals.length - 1]; // profit value on PO row
+    return parseFloat(lastVal);
   }
   return null;
 }
