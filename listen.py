@@ -31,8 +31,7 @@ ML1_GAP_S     = float(os.getenv("ML1_GAP_S", "3"))
 ML2_GAP_S     = float(os.getenv("ML2_GAP_S", "2"))
 
 # Legacy knobs kept for compatibility (ignored if *_GAP_S provided)
-ML1_DELAY_MS  = int(os.getenv("ML1_DELAY_MS", "700"))
-ML2_DELAY_MS  = int(os.getenv("ML2_DELAY_MS", "2700"))
+
 
 if not api_id or not api_hash:
     print("[FATAL] API_ID/API_HASH missing in .env"); sys.exit(1)
