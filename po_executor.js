@@ -1,4 +1,5 @@
 // po_executor.js — Executor with instant OPEN + background result parse
+// Optimized: Caches lastPair/lastDirection across ML levels to save time
 // Fixes:
 //   1. Added /peek endpoint so Python can cancel ML legs on WIN
 //   2. Result parser matches trade by amount + close time window
@@ -6,8 +7,10 @@
 //   4. forceCloseOverlays handles both asset dropdowns + Magnific popups
 //   5. Screenshot on failed clicks for instant debugging
 //   6. Screenshot on selectPair failure for instant debugging
-//   7. Hard overlay nuke (div.mfp-bg, div.mfp-wrap) before selecting pair
+//   7. Hard overlay nuke (conditional) before selecting pair
 //   8. /trade endpoint responds instantly, runs placeTrade in background (fixes ML delays)
+//   9. Tightened sleeps in overlays to 400ms
+//  10. Pair/direction cached across ML levels to skip redundant selectPair
 
 const path = require("path");
 const express = require("express");
@@ -39,6 +42,8 @@ const SEL = {
 let context, page;
 let tradeInProgress = false;
 let lastTradeMeta = null; // { amount, ts }
+let lastPairCache = null;
+let lastDirectionCache = null;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ----------------------------- Utilities ------------------------------------
@@ -49,7 +54,7 @@ async function withRetry(fn, attempts = 2, label = "op") {
     catch (err) {
       lastErr = err;
       console.warn(`[Retry] ${label} failed (${i + 1}/${attempts}) -> ${err?.message}`);
-      await sleep(300);
+      await sleep(200); // tightened retry wait
     }
   }
   throw lastErr;
@@ -62,13 +67,14 @@ async function waitForTradePanel() {
 
 async function forceCloseOverlays() {
   try {
-    // Hard nuke — instant removal
+    const overlayVisible = await page.locator("div.mfp-wrap, .drop-down-modal-wrap.active").first().isVisible().catch(() => false);
+    if (!overlayVisible) return;
+
     await page.evaluate(() => {
       document.querySelectorAll("div.mfp-bg, div.mfp-wrap, .drop-down-modal-wrap.active").forEach(el => el.remove());
     }).catch(() => {});
 
-    // Safety: if still visible after 1s, reload
-    await sleep(1000);
+    await sleep(400); // tightened
     const stillVisible = await page.locator("div.mfp-wrap, .drop-down-modal-wrap.active").first().isVisible().catch(() => false);
     if (stillVisible) {
       console.log("[Heal] Overlay stuck — reloading page");
@@ -120,22 +126,14 @@ async function setTradeAmount(amount) {
 
 // ----------------------------- Patched selectPair ---------------------------
 async function selectPair(pair) {
-  const toggle = page.locator(SEL.symbolToggle).first();
-  let current = "";
-  try { current = (await toggle.textContent({ timeout: 800 })) || ""; } catch {}
-  if (current && current.toLowerCase().includes(pair.toLowerCase().replace(" otc", ""))) {
-    console.log(`[Step] Pair already selected: ${pair}`);
-    await forceCloseOverlays();
+  // If cached pair matches, skip selection
+  if (lastPairCache && lastPairCache.toLowerCase() === pair.toLowerCase()) {
+    console.log(`[Cache] Skipping selectPair, reusing: ${pair}`);
     return;
   }
 
+  const toggle = page.locator(SEL.symbolToggle).first();
   try {
-    // HARD NUKE of overlays before click
-    await page.evaluate(() => {
-      document.querySelectorAll("div.mfp-bg, div.mfp-wrap").forEach(el => el.remove());
-    }).catch(() => {});
-    await forceCloseOverlays();
-
     await withRetry(async () => {
       await toggle.click({ timeout: DEFAULT_TIMEOUT });
       await page.waitForSelector(SEL.assetOverlay, { state: 'visible', timeout: DEFAULT_TIMEOUT });
@@ -145,7 +143,7 @@ async function selectPair(pair) {
     const search = page.locator(SEL.searchInput).first();
     await search.fill("");
     await search.type(cleaned, { delay: 30 }).catch(() => {});
-    await sleep(250);
+    await sleep(200);
 
     const listItem = page.locator('.alist__label', { hasText: pair }).first();
     await withRetry(async () => { await listItem.click({ timeout: DEFAULT_TIMEOUT }); }, 2, "select list item");
@@ -153,8 +151,9 @@ async function selectPair(pair) {
     console.log(`[Step] Selected pair: ${pair}`);
     await page.keyboard.press('Escape').catch(() => {});
     await forceCloseOverlays();
-    await sleep(150);
+    await sleep(100);
 
+    lastPairCache = pair; // update cache
   } catch (err) {
     const ts = Date.now();
     const screenshotPath = path.join(SCREEN_DIR, `selectPair_fail_${pair}_${ts}.png`);
@@ -239,6 +238,7 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   tradeInProgress = false;
 
   lastTradeMeta = { amount: Number(amount), ts: Date.now() };
+  lastDirectionCache = direction;
 
   const ts = new Date().toISOString();
   appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag);
@@ -289,13 +289,12 @@ async function peekLatestProfit() {
   const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
   const dollarVals = (rowText.match(/\$-?[0-9.]+/g) || []).map(s => parseFloat(s.replace("$", "")));
 
-  // --- Relaxed amount match: ±max($0.02, 2%) tolerance ---
   const tol = Math.max(0.02, Number(amount) * 0.02);
   const hasApproxAmount = dollarVals.some(v => Math.abs(v - Number(amount)) <= tol);
   const withinWindow = (Date.now() - ts) < 6 * 60 * 1000;
 
   if (hasApproxAmount && withinWindow && dollarVals.length) {
-    const lastVal = dollarVals[dollarVals.length - 1]; // profit value on PO row
+    const lastVal = dollarVals[dollarVals.length - 1];
     return parseFloat(lastVal);
   }
   return null;
@@ -312,10 +311,8 @@ app.post("/trade", (req, res) => {
     return res.status(400).json({ success: false, error: "pair, amount, direction required" });
   }
 
-  // Respond instantly so Python doesn’t get blocked
   res.json({ success: true, result: "QUEUED", pair, amount, direction, ml_tag });
 
-  // Run the trade in background
   (async () => {
     try {
       await placeTrade(pair, amount, direction, ml_tag);
