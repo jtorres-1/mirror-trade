@@ -265,9 +265,9 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
 async function parseClosedTrade(amount, pair, direction, ml_tag) {
   let profit = 0.0, result = "LOSS";
   try {
-    await page.locator(SEL.closedTab).click({ timeout: 5000 });
+    await page.locator(SEL.closedTab).click({ timeout: 1000 });
     const row = page.locator(SEL.closedRow).first();
-    await row.waitFor({ state: "visible", timeout: 15000 });
+    await row.waitFor({ state: "visible", timeout: 2000 });
     const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
     console.log(`[Debug] Closed row text: ${rowText}`);
 
