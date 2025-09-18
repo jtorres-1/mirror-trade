@@ -29,7 +29,8 @@ base_amount = float(os.getenv("TRADE_AMOUNT", "1"))
 mg_mult     = float(os.getenv("MARTINGALE_MULT", "2.2"))
 MAX_STAKE   = float(os.getenv("MAX_STAKE", "10.65"))
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
-SKEW_MS     = int(os.getenv("SKEW_MS", "2200"))   # Base early fire
+# 🔥 Increased skew to compensate for drift
+SKEW_MS     = int(os.getenv("SKEW_MS", "4200"))   # Base early fire (was 2200)
 ML1_DELAY_MS = int(os.getenv("ML1_DELAY_MS", "700"))
 ML2_DELAY_MS = int(os.getenv("ML2_DELAY_MS", "2700"))
 
@@ -218,15 +219,21 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int]):
         await asyncio.sleep(delay)
 
         if ml_label in (1, 2):
-            for _ in range(8):  # ~2s guard window
+            # 🔥 Extended guard window & final just-before-fire peek
+            for _ in range(16):  # ~4s guard window
                 ok, p = quick_peek()
                 if ok and p > 0:
                     reset_chain(f"{label} cancelled: WIN via /peek (profit {p})")
                     return
-                if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6:
+                if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 8:
                     reset_chain(f"{label} cancelled: WIN ping from channel")
                     return
                 await asyncio.sleep(0.25)
+            # Final peek before executing
+            ok, p = quick_peek()
+            if ok and p > 0:
+                reset_chain(f"{label} cancelled last-sec: WIN via /peek (profit {p})")
+                return
 
         amt = base_amount if ml_label is None else min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
         await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=ml_label)
