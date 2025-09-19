@@ -197,7 +197,7 @@ def executor_trade(pair, amount, direction, ml_tag) -> Dict:
     return {"success": False, "result": "OPEN", "profit": 0}
 
 async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> None:
-    global executor_busy, daily_pnl, halted_for_day, ml1_task, ml2_task
+    global executor_busy, daily_pnl, halted_for_day, ml1_task, ml2_task, last_win_chain
     if DAILY_STOP_LOSS > 0 and daily_pnl <= -DAILY_STOP_LOSS:
         print("[HALT] Daily stop loss reached. Skip trade.")
         return
@@ -219,6 +219,9 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
         print(f"[API] Fired: {direction} {clean_pair} ${amount} [{ml_tag}] → {result}")
 
         exec_time = datetime.utcnow()
+
+        if profit > 0:
+            last_win_chain = current["chain_id"]
 
         if ml_label is None:
             current["base_exec_at"] = exec_time
@@ -268,16 +271,16 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
             start = datetime.utcnow()
             while (datetime.utcnow() - start).total_seconds() < 2.0:
                 ok, p = quick_peek()
-                if ok and p > 0 and cid == current["chain_id"]:
+                if ok and p > 0 and cid == current["chain_id"] and last_win_chain == cid:
                     reset_chain(f"{label} cancelled: WIN via /peek (profit {p})")
                     return
-                if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6 and cid == current["chain_id"]:
+                if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6 and cid == current["chain_id"] and last_win_chain == cid:
                     reset_chain(f"{label} cancelled: WIN ping")
                     return
                 await asyncio.sleep(0.2)
             # final last-sec peek
             ok, p = quick_peek()
-            if ok and p > 0 and cid == current["chain_id"]:
+            if ok and p > 0 and cid == current["chain_id"] and last_win_chain == cid:
                 reset_chain(f"{label} cancelled last-sec: WIN via /peek (profit {p})")
                 return
 
