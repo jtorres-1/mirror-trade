@@ -41,7 +41,7 @@ const SEL = {
 
 let context, page;
 let tradeInProgress = false;
-let lastTradeMeta = null; // { amount, ts }
+let lastTradeMeta = null; // { amount, ts, pair, direction, ml_tag }
 let lastPairCache = null;
 let lastDirectionCache = null;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -237,7 +237,9 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
   tradeInProgress = false;
 
-  lastTradeMeta = { amount: Number(amount), ts: Date.now() };
+  lastTradeMeta = { amount: Number(amount), ts: Date.now(), pair, direction, ml_tag }; // patched
+
+  lastPairCache = pair;
   lastDirectionCache = direction;
 
   const ts = new Date().toISOString();
@@ -278,7 +280,7 @@ async function parseClosedTrade(amount, pair, direction, ml_tag) {
 // ----------------------------- Peek Endpoint --------------------------------
 async function peekLatestProfit() {
   if (!lastTradeMeta) return null;
-  const { amount, ts } = lastTradeMeta;
+  const { amount, ts, ml_tag } = lastTradeMeta;
 
   await ensurePageAlive();
   try { await page.locator(SEL.closedTab).click({ timeout: 3000 }); } catch {}
@@ -290,12 +292,12 @@ async function peekLatestProfit() {
   const dollarVals = (rowText.match(/\$-?[0-9.]+/g) || []).map(s => parseFloat(s.replace("$", "")));
 
   const tol = Math.max(0.02, Number(amount) * 0.02);
-  const hasApproxAmount = dollarVals.some(v => Math.abs(v - Number(amount)) <= tol);
   const withinWindow = (Date.now() - ts) < 6 * 60 * 1000;
+  const hasApproxAmount = dollarVals.some(v => Math.abs(v - Number(amount)) <= tol);
 
   if (hasApproxAmount && withinWindow && dollarVals.length) {
     const lastVal = dollarVals[dollarVals.length - 1];
-    return parseFloat(lastVal);
+    return { profit: parseFloat(lastVal), ml_tag }; // patched: return ml_tag too
   }
   return null;
 }
@@ -324,11 +326,11 @@ app.post("/trade", (req, res) => {
 
 app.get("/peek", async (req, res) => {
   try {
-    const profit = await peekLatestProfit();
-    if (profit === null) return res.json({ ok: false, profit: 0 });
-    return res.json({ ok: true, profit });
+    const result = await peekLatestProfit();
+    if (!result) return res.json({ ok: false, profit: 0, ml_tag: "" });
+    return res.json({ ok: true, profit: result.profit, ml_tag: result.ml_tag || "" });
   } catch (err) {
-    return res.json({ ok: false, error: err?.message || String(err), profit: 0 });
+    return res.json({ ok: false, error: err?.message || String(err), profit: 0, ml_tag: "" });
   }
 });
 
