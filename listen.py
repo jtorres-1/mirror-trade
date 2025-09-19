@@ -220,8 +220,22 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
 
         exec_time = datetime.utcnow()
 
+        # --- PATCH: cancel future legs on any WIN ---
         if profit > 0:
             last_win_chain = current["chain_id"]
+            if ml_label is None:  # Base WIN
+                cancel_task(ml1_task); ml1_task = None
+                cancel_task(ml2_task); ml2_task = None
+                reset_chain("Base WIN — cancelled future ML legs.")
+                return
+            elif ml_label == 1:  # ML1 WIN
+                cancel_task(ml2_task); ml2_task = None
+                reset_chain("ML1 WIN — cancelled ML2.")
+                return
+            elif ml_label == 2:  # ML2 WIN
+                reset_chain("ML2 WIN — chain complete.")
+                return
+        # --- END PATCH ---
 
         if ml_label is None:
             current["base_exec_at"] = exec_time
