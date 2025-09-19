@@ -1,6 +1,6 @@
-# listen.py — Telegram -> PocketOption with martingale (anchored ML, tight gaps, no ghosts)
+# listen.py — Telegram -> PocketOption with martingale (anchored ML, tight gaps, no ghosts, chain fingerprint)
 
-import os, re, csv, asyncio, sys, requests, emoji
+import os, re, csv, asyncio, sys, requests, emoji, uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 from dotenv import load_dotenv
@@ -108,7 +108,8 @@ current = {
     "active": False, "pair": None, "direction": None, "expiry_min": 5,
     "amount": base_amount,
     "base_exec_at": None,
-    "ml1_exec_at": None
+    "ml1_exec_at": None,
+    "chain_id": None  # new fingerprint per signal
 }
 last_signal_utc: Optional[datetime] = None
 seen_ids = set()
@@ -141,28 +142,31 @@ def cancel_all_tasks():
 def arm_ttl(until_dt: datetime, why: str):
     global ttl_task
     cancel_task(ttl_task)
-    async def _ttl(deadline_dt: datetime):
+    async def _ttl(deadline_dt: datetime, cid: str):
         try:
             await asyncio.sleep(max(0, (deadline_dt - datetime.utcnow()).total_seconds() + 60))
-            if current["active"]:
+            if current["active"] and current["chain_id"] == cid:
                 reset_chain("TTL watchdog expired")
         except asyncio.CancelledError:
             return
-    ttl_task = asyncio.create_task(_ttl(until_dt))
+    cid = current["chain_id"]
+    ttl_task = asyncio.create_task(_ttl(until_dt, cid))
     scheduled_tasks.append(ttl_task)
-    print(f"[TTL] armed until {until_dt} ({why})")
+    print(f"[TTL] armed until {until_dt} ({why}) [chain={cid}]")
 
 def reset_chain(reason=""):
     cancel_all_tasks()
     current.update({
         "active": False, "pair": None, "direction": None,
         "expiry_min": 5, "amount": base_amount,
-        "base_exec_at": None, "ml1_exec_at": None
+        "base_exec_at": None, "ml1_exec_at": None,
+        "chain_id": None
     })
     if reason: print(f"[RESET] {reason}")
     else:      print("[RESET] Chain cleared.")
 
 last_win_ping_utc: Optional[datetime] = None
+last_win_chain: Optional[str] = None
 WIN_HINT_RE = re.compile(r'\bWIN\b|\bVICTORY\b', re.I)
 
 PO_URL = "http://localhost:3000"
@@ -222,7 +226,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
             gap1 = ML1_GAP_S if ML1_GAP_S is not None else 3
             ml1_fire = base_close + timedelta(seconds=gap1)
             cancel_task(ml1_task)
-            ml1_task = asyncio.create_task(schedule_leg(ml1_fire, 1, base_close))
+            ml1_task = asyncio.create_task(schedule_leg(ml1_fire, 1, base_close, current["chain_id"]))
             print(f"[CHAIN] ML1 anchored → {ml1_fire} (gap {gap1:.2f}s after base close)")
             arm_ttl(base_close + timedelta(minutes=expiry_min, seconds=30), "base->ml1 span")
 
@@ -232,7 +236,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
             gap2 = ML2_GAP_S if ML2_GAP_S is not None else 2
             ml2_fire = ml1_close + timedelta(seconds=gap2)
             cancel_task(ml2_task)
-            ml2_task = asyncio.create_task(schedule_leg(ml2_fire, 2, ml1_close))
+            ml2_task = asyncio.create_task(schedule_leg(ml2_fire, 2, ml1_close, current["chain_id"]))
             print(f"[CHAIN] ML2 anchored → {ml2_fire} (gap {gap2:.2f}s after ML1 close)")
             arm_ttl(ml1_close + timedelta(minutes=expiry_min, seconds=30), "ml1->ml2 span")
 
@@ -247,10 +251,10 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
         reset_chain("ML2 placed; chain released.")
 
 # ── Scheduling ────────────────────────────────────────────────────────────────
-async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: Optional[datetime] = None):
+async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: Optional[datetime] = None, cid: Optional[str] = None):
     label = "BASE" if ml_label is None else f"ML{ml_label}"
     delay = max(0.0, (fire_dt - datetime.utcnow()).total_seconds())
-    print(f"[SCHEDULE] {label} fire={fire_dt} delay={delay:.3f}s")
+    print(f"[SCHEDULE] {label} fire={fire_dt} delay={delay:.3f}s [chain={cid}]")
 
     try:
         await asyncio.sleep(delay)
@@ -260,20 +264,20 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
                 while datetime.utcnow() < prev_close:
                     await asyncio.sleep(0.1)  # finer wait
 
-            # dynamic guard loop — break as soon as result known
+            # dynamic guard loop — only cancel if same chain
             start = datetime.utcnow()
             while (datetime.utcnow() - start).total_seconds() < 2.0:
                 ok, p = quick_peek()
-                if ok and p > 0:
+                if ok and p > 0 and cid == current["chain_id"]:
                     reset_chain(f"{label} cancelled: WIN via /peek (profit {p})")
                     return
-                if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6:
+                if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6 and cid == current["chain_id"]:
                     reset_chain(f"{label} cancelled: WIN ping")
                     return
                 await asyncio.sleep(0.2)
             # final last-sec peek
             ok, p = quick_peek()
-            if ok and p > 0:
+            if ok and p > 0 and cid == current["chain_id"]:
                 reset_chain(f"{label} cancelled last-sec: WIN via /peek (profit {p})")
                 return
 
@@ -335,20 +339,21 @@ async def handle_signal_from_text(text: str, msg_date=None):
         print("[INFO] Chain active; ignoring new signal.")
         return True
 
-    pair = force_otc(sig["pair"])
+    # new fingerprint
+    cid = str(uuid.uuid4())[:8]
     current.update({
-        "active": True, "pair": pair, "direction": sig["direction"],
+        "active": True, "pair": force_otc(sig["pair"]), "direction": sig["direction"],
         "expiry_min": sig["expiry_min"], "amount": base_amount,
-        "base_exec_at": None, "ml1_exec_at": None
+        "base_exec_at": None, "ml1_exec_at": None, "chain_id": cid
     })
     last_signal_utc = now_utc
-    print(f"[SIGNAL] {pair} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']}")
+    print(f"[SIGNAL] {current['pair']} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} [chain={cid}]")
 
     cancel_task(ml1_task); ml1_task = None
     cancel_task(ml2_task); ml2_task = None
 
     base_fire = base_dt - timedelta(milliseconds=SKEW_MS)
-    t0 = asyncio.create_task(schedule_leg(base_fire, None)); scheduled_tasks.append(t0)
+    t0 = asyncio.create_task(schedule_leg(base_fire, None, cid=cid)); scheduled_tasks.append(t0)
 
     arm_ttl(base_fire + timedelta(minutes=current["expiry_min"], seconds=45), "base window")
     return True
