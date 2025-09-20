@@ -271,11 +271,11 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
 async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: Optional[datetime] = None, cid: Optional[str] = None):
     label = "BASE" if ml_label is None else f"ML{ml_label}"
 
-    # --- HARD GUARD: block ML2 if ML1 already won ---
-    if ml_label == 2 and last_win_chain == cid:
-        print(f"[GUARD] ML2 blocked because ML1 already won [chain={cid}]")
+    # --- HARD GUARD: block ML1/ML2 if chain already won ---
+    if ml_label in (1, 2) and last_win_chain == cid:
+        print(f"[GUARD] {label} blocked because a previous leg already won [chain={cid}]")
         return
-    # -----------------------------------------------
+    # -----------------------------------------------------
 
     delay = max(0.0, (fire_dt - datetime.utcnow()).total_seconds())
     print(f"[SCHEDULE] {label} fire={fire_dt} delay={delay:.3f}s [chain={cid}]")
