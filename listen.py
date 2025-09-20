@@ -24,7 +24,6 @@ MAX_STAKE       = float(os.getenv("MAX_STAKE", "10.65"))
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
 
 SKEW_MS       = int(os.getenv("SKEW_MS", "4200"))
-
 ML1_GAP_S     = float(os.getenv("ML1_GAP_S", "2"))
 ML2_GAP_S     = float(os.getenv("ML2_GAP_S", "2"))
 
@@ -109,7 +108,7 @@ current = {
     "amount": base_amount,
     "base_exec_at": None,
     "ml1_exec_at": None,
-    "chain_id": None  # new fingerprint per signal
+    "chain_id": None
 }
 last_signal_utc: Optional[datetime] = None
 seen_ids = set()
@@ -220,41 +219,38 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
 
         exec_time = datetime.utcnow()
 
-        # --- PATCH: cancel future legs on any WIN ---
+        # Cancel on win (base, ml1, ml2)
         if profit > 0:
             last_win_chain = current["chain_id"]
-            if ml_label is None:  # Base WIN
+            if ml_label is None:
                 cancel_task(ml1_task); ml1_task = None
                 cancel_task(ml2_task); ml2_task = None
                 reset_chain("Base WIN — cancelled future ML legs.")
                 return
-            elif ml_label == 1:  # ML1 WIN
+            elif ml_label == 1:
                 cancel_task(ml2_task); ml2_task = None
                 reset_chain("ML1 WIN — cancelled ML2.")
                 return
-            elif ml_label == 2:  # ML2 WIN
+            elif ml_label == 2:
                 reset_chain("ML2 WIN — chain complete.")
                 return
-        # --- END PATCH ---
 
         if ml_label is None:
             current["base_exec_at"] = exec_time
             base_close = exec_time + timedelta(minutes=expiry_min)
-            gap1 = ML1_GAP_S if ML1_GAP_S is not None else 3
-            ml1_fire = base_close + timedelta(seconds=gap1)
+            ml1_fire = base_close + timedelta(seconds=ML1_GAP_S)
             cancel_task(ml1_task)
             ml1_task = asyncio.create_task(schedule_leg(ml1_fire, 1, base_close, current["chain_id"]))
-            print(f"[CHAIN] ML1 anchored → {ml1_fire} (gap {gap1:.2f}s after base close)")
+            print(f"[CHAIN] ML1 anchored → {ml1_fire} (gap {ML1_GAP_S:.2f}s after base close)")
             arm_ttl(base_close + timedelta(minutes=expiry_min, seconds=30), "base->ml1 span")
 
         elif ml_label == 1:
             current["ml1_exec_at"] = exec_time
             ml1_close = exec_time + timedelta(minutes=expiry_min)
-            gap2 = ML2_GAP_S if ML2_GAP_S is not None else 2
-            ml2_fire = ml1_close + timedelta(seconds=gap2)
+            ml2_fire = ml1_close + timedelta(seconds=ML2_GAP_S)
             cancel_task(ml2_task)
             ml2_task = asyncio.create_task(schedule_leg(ml2_fire, 2, ml1_close, current["chain_id"]))
-            print(f"[CHAIN] ML2 anchored → {ml2_fire} (gap {gap2:.2f}s after ML1 close)")
+            print(f"[CHAIN] ML2 anchored → {ml2_fire} (gap {ML2_GAP_S:.2f}s after ML1 close)")
             arm_ttl(ml1_close + timedelta(minutes=expiry_min, seconds=30), "ml1->ml2 span")
 
         elif ml_label == 2:
@@ -267,16 +263,9 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
         print("[DONE] ML2 placed. Freeing chain for next signal.")
         reset_chain("ML2 placed; chain released.")
 
-# ── Scheduling ────────────────────────────────────────────────────────────────
+# ── Scheduling with guard ─────────────────────────────────────────────────────
 async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: Optional[datetime] = None, cid: Optional[str] = None):
     label = "BASE" if ml_label is None else f"ML{ml_label}"
-
-    # --- HARD GUARD: block ML1/ML2 if chain already won ---
-    if ml_label in (1, 2) and last_win_chain == cid:
-        print(f"[GUARD] {label} blocked because a previous leg already won [chain={cid}]")
-        return
-    # -----------------------------------------------------
-
     delay = max(0.0, (fire_dt - datetime.utcnow()).total_seconds())
     print(f"[SCHEDULE] {label} fire={fire_dt} delay={delay:.3f}s [chain={cid}]")
 
@@ -286,22 +275,22 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
         if ml_label in (1, 2):
             if prev_close:
                 while datetime.utcnow() < prev_close:
-                    await asyncio.sleep(0.1)  # finer wait
+                    await asyncio.sleep(0.1)
 
-            # dynamic guard loop — only cancel if same chain
+            # re-check right before firing
             start = datetime.utcnow()
             while (datetime.utcnow() - start).total_seconds() < 2.0:
                 ok, p = quick_peek()
-                if ok and p > 0 and cid == current["chain_id"] and last_win_chain == cid:
+                if ok and p > 0:
                     reset_chain(f"{label} cancelled: WIN via /peek (profit {p})")
                     return
-                if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6 and cid == current["chain_id"] and last_win_chain == cid:
+                if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6:
                     reset_chain(f"{label} cancelled: WIN ping")
                     return
                 await asyncio.sleep(0.2)
-            # final last-sec peek
+
             ok, p = quick_peek()
-            if ok and p > 0 and cid == current["chain_id"] and last_win_chain == cid:
+            if ok and p > 0:
                 reset_chain(f"{label} cancelled last-sec: WIN via /peek (profit {p})")
                 return
 
@@ -386,9 +375,6 @@ async def on_signal(e):
     if e.message.id in seen_ids:
         return
     seen_ids.add(e.message.id)
-    src = getattr(getattr(e, "chat", None), "title", None) or ""
-    username = getattr(getattr(e, "chat", None), "username", None)
-    print(f"[TG DEBUG] Incoming from: '{src}' (@{username})")
     text = (e.message.message or "").strip()
     print("[TG RAW]", text.replace("\n"," | ")[:500])
     ok = await handle_signal_from_text(text, msg_date=e.message.date)
