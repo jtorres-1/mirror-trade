@@ -339,7 +339,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
 
     should_block = True
     for _ in range(6):
-        ok, p = quick_peek()
+        ok, p, tag = quick_peek()
         if not ok:
             should_block = False
             break
