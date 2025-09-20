@@ -225,15 +225,18 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
             if ml_label is None:
                 cancel_task(ml1_task); ml1_task = None
                 cancel_task(ml2_task); ml2_task = None
-                reset_chain("Base WIN — cancelled future ML legs.")
+                reset_chain(f"Base WIN — cancelled future ML legs. [chain={last_win_chain}]")
                 return
             elif ml_label == 1:
                 cancel_task(ml2_task); ml2_task = None
-                reset_chain("ML1 WIN — cancelled ML2.")
+                reset_chain(f"ML1 WIN — cancelled ML2. [chain={last_win_chain}]")
                 return
             elif ml_label == 2:
-                reset_chain("ML2 WIN — chain complete.")
+                reset_chain(f"ML2 WIN — chain complete. [chain={last_win_chain}]")
                 return
+        elif ml_label is None and profit <= 0:
+            # Base lost, clear stale win chain
+            last_win_chain = None
 
         if ml_label is None:
             current["base_exec_at"] = exec_time
@@ -281,17 +284,17 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
             start = datetime.utcnow()
             while (datetime.utcnow() - start).total_seconds() < 2.0:
                 ok, p = quick_peek()
-                if ok and p > 0:
-                    reset_chain(f"{label} cancelled: WIN via /peek (profit {p})")
+                if ok and p > 0 and last_win_chain == cid:
+                    reset_chain(f"{label} cancelled: WIN via /peek (profit {p}) [chain={cid}]")
                     return
-                if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6:
-                    reset_chain(f"{label} cancelled: WIN ping")
+                if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6 and last_win_chain == cid:
+                    reset_chain(f"{label} cancelled: WIN ping [chain={cid}]")
                     return
                 await asyncio.sleep(0.2)
 
             ok, p = quick_peek()
-            if ok and p > 0:
-                reset_chain(f"{label} cancelled last-sec: WIN via /peek (profit {p})")
+            if ok and p > 0 and last_win_chain == cid:
+                reset_chain(f"{label} cancelled last-sec: WIN via /peek (profit {p}) [chain={cid}]")
                 return
 
         amt = base_amount if ml_label is None else min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
