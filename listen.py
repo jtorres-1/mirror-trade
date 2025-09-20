@@ -173,15 +173,16 @@ PO_URL = "http://localhost:3000"
 def force_otc(pair: str) -> str:
     return pair if (not FORCE_OTC or "OTC" in pair.upper()) else f"{pair} OTC"
 
-def quick_peek() -> (bool, float):
+def quick_peek() -> (bool, float, str):
     try:
         r = requests.get(f"{PO_URL}/peek", timeout=1.5)
         if r.status_code == 200:
             j = r.json()
-            return bool(j.get("ok", False)), float(j.get("profit", 0.0))
+            return bool(j.get("ok", False)), float(j.get("profit", 0.0)), j.get("ml_tag", "")
     except Exception:
         pass
-    return False, 0.0
+    return False, 0.0, ""
+
 
 def executor_trade(pair, amount, direction, ml_tag) -> Dict:
     payload = {"pair": pair, "amount": amount, "direction": direction.lower(), "ml_tag": ml_tag}
@@ -283,18 +284,18 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
             # re-check right before firing
             start = datetime.utcnow()
             while (datetime.utcnow() - start).total_seconds() < 2.0:
-                ok, p = quick_peek()
+                ok, p, tag = quick_peek()
                 if ok and p > 0 and last_win_chain == cid:
-                    reset_chain(f"{label} cancelled: WIN via /peek (profit {p}) [chain={cid}]")
+                    reset_chain(f"{label} cancelled: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
                     return
                 if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6 and last_win_chain == cid:
                     reset_chain(f"{label} cancelled: WIN ping [chain={cid}]")
                     return
                 await asyncio.sleep(0.2)
 
-            ok, p = quick_peek()
+            ok, p, tag = quick_peek()
             if ok and p > 0 and last_win_chain == cid:
-                reset_chain(f"{label} cancelled last-sec: WIN via /peek (profit {p}) [chain={cid}]")
+                reset_chain(f"{label} cancelled last-sec: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
                 return
 
         amt = base_amount if ml_label is None else min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
@@ -302,6 +303,7 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
     except asyncio.CancelledError:
         print(f"[CANCEL] {label} cancelled.")
         return
+
 
 async def handle_signal_from_text(text: str, msg_date=None):
     global last_signal_utc, daily_pnl, halted_for_day, current, scheduled_tasks, last_win_ping_utc, ml1_task, ml2_task
