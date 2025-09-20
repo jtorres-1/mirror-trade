@@ -109,7 +109,7 @@ current = {
     "amount": base_amount,
     "base_exec_at": None,
     "ml1_exec_at": None,
-    "chain_id": None
+    "chain_id": None  # new fingerprint per signal
 }
 last_signal_utc: Optional[datetime] = None
 seen_ids = set()
@@ -229,7 +229,6 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
                 reset_chain("Base WIN — cancelled future ML legs.")
                 return
             elif ml_label == 1:  # ML1 WIN
-                last_win_chain = current["chain_id"]
                 cancel_task(ml2_task); ml2_task = None
                 reset_chain("ML1 WIN — cancelled ML2.")
                 return
@@ -271,23 +270,25 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
 # ── Scheduling ────────────────────────────────────────────────────────────────
 async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: Optional[datetime] = None, cid: Optional[str] = None):
     label = "BASE" if ml_label is None else f"ML{ml_label}"
+
+    # --- HARD GUARD: block ML2 if ML1 already won ---
+    if ml_label == 2 and last_win_chain == cid:
+        print(f"[GUARD] ML2 blocked because ML1 already won [chain={cid}]")
+        return
+    # -----------------------------------------------
+
     delay = max(0.0, (fire_dt - datetime.utcnow()).total_seconds())
     print(f"[SCHEDULE] {label} fire={fire_dt} delay={delay:.3f}s [chain={cid}]")
 
     try:
         await asyncio.sleep(delay)
 
-        # --- HARD GUARD: prevent ML2 after ML1 WIN ---
-        if ml_label == 2 and last_win_chain == cid:
-            print(f"[GUARD] ML2 cancelled because ML1 already won [chain={cid}]")
-            return
-
         if ml_label in (1, 2):
             if prev_close:
                 while datetime.utcnow() < prev_close:
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.1)  # finer wait
 
-            # dynamic guard loop
+            # dynamic guard loop — only cancel if same chain
             start = datetime.utcnow()
             while (datetime.utcnow() - start).total_seconds() < 2.0:
                 ok, p = quick_peek()
@@ -298,6 +299,7 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
                     reset_chain(f"{label} cancelled: WIN ping")
                     return
                 await asyncio.sleep(0.2)
+            # final last-sec peek
             ok, p = quick_peek()
             if ok and p > 0 and cid == current["chain_id"] and last_win_chain == cid:
                 reset_chain(f"{label} cancelled last-sec: WIN via /peek (profit {p})")
@@ -361,6 +363,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
         print("[INFO] Chain active; ignoring new signal.")
         return True
 
+    # new fingerprint
     cid = str(uuid.uuid4())[:8]
     current.update({
         "active": True, "pair": force_otc(sig["pair"]), "direction": sig["direction"],
