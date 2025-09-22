@@ -2,6 +2,7 @@
 # Patched: consumes chain_id from Node executor to ensure cancels only apply to the correct chain.
 # Added: expected_close validation so past wins can't cancel the wrong chain.
 # Refined: overwrite expected_close with closed_at from Node, ±5s tolerance.
+# Fixed: guard now skips /peek if no active chain_id, preventing stale-blocks.
 
 import os, re, csv, asyncio, sys, requests, emoji, uuid
 from datetime import datetime, timedelta, timezone
@@ -349,21 +350,28 @@ async def handle_signal_from_text(text: str, msg_date=None):
         print("[INFO] Rapid signal ignored.")
         return True
 
+    # ── FIX: Guard only if chain_id exists ───────────────────────────────
     should_block = True
-    for _ in range(6):
-        ok, p, tag, peek_chain, closed_at = quick_peek(current["chain_id"] or "")
-        if not ok:
-            should_block = False
-            break
-        if p != 0:
-            if p > 0:
-                last_win_ping_utc = datetime.utcnow()
-            should_block = False
-            break
-        await asyncio.sleep(0.2)
+    cid = current["chain_id"]
+    if not cid:  # no active chain, nothing to block
+        should_block = False
+    else:
+        for _ in range(6):
+            ok, p, tag, peek_chain, closed_at = quick_peek(cid)
+            if not ok:
+                should_block = False
+                break
+            if p != 0:
+                if p > 0:
+                    last_win_ping_utc = datetime.utcnow()
+                should_block = False
+                break
+            await asyncio.sleep(0.2)
+
     if should_block:
         print("[GUARD] Skipping new BASE: unresolved trade still open.")
         return True
+    # ─────────────────────────────────────────────────────────────────────
 
     if current["active"]:
         print("[INFO] Chain active; ignoring new signal.")
