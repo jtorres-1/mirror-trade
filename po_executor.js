@@ -13,6 +13,7 @@
 //  10. Pair/direction cached across ML levels to skip redundant selectPair
 //  11. Patched to carry chain_id through trades, /peek, and logs
 //  12. Added closed_at timestamp capture in parseClosedTrade and /peek
+//  13. NEW: recentTrades buffer keyed by chain_id, so /peek is chain-specific
 
 const path = require("path");
 const express = require("express");
@@ -44,6 +45,7 @@ const SEL = {
 let context, page;
 let tradeInProgress = false;
 let lastTradeMeta = null; // { amount, ts, pair, direction, ml_tag, chain_id, closed_at }
+let recentTrades = {};    // NEW: buffer of trades by chain_id
 let lastPairCache = null;
 let lastDirectionCache = null;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -255,6 +257,15 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "") {
 }
 
 // ----------------------------- Result Parser --------------------------------
+function recordClosedTrade(meta) {
+  const { chain_id } = meta;
+  if (!chain_id) return;
+  if (!recentTrades[chain_id]) recentTrades[chain_id] = [];
+  recentTrades[chain_id].unshift(meta);
+  if (recentTrades[chain_id].length > 5) recentTrades[chain_id].pop();
+  lastTradeMeta = meta;
+}
+
 async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") {
   let profit = 0.0, result = "LOSS", closed_at = new Date().toISOString();
   try {
@@ -271,7 +282,6 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
       result = profit > 0 ? "WIN" : "LOSS";
     }
 
-    // patch: extract closed_at timestamp from rowText if available
     const timeMatch = rowText.match(/\d{2}:\d{2}/);
     if (timeMatch) {
       const now = new Date();
@@ -281,7 +291,8 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
     console.error("[❌] Result parse failed:", err.message);
   }
 
-  lastTradeMeta = { ...lastTradeMeta, closed_at };
+  const meta = { amount, pair, direction, ml_tag, chain_id, profit, result, closed_at };
+  recordClosedTrade(meta);
 
   const ts2 = new Date().toISOString();
   appendLog(ts2, pair, direction, amount, result, profit, ml_tag, chain_id, closed_at);
@@ -289,31 +300,16 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
 }
 
 // ----------------------------- Peek Endpoint --------------------------------
-async function peekLatestProfit() {
-  if (!lastTradeMeta) return null;
-  const { amount, ts, ml_tag, chain_id, closed_at } = lastTradeMeta;
-
+async function peekLatestProfit(chain_id = null) {
   await ensurePageAlive();
   try { await page.locator(SEL.closedTab).click({ timeout: 3000 }); } catch {}
-  const row = page.locator(SEL.closedRow).first();
-  const visible = await row.isVisible().catch(() => false);
-  if (!visible) return null;
 
-  const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
-  const dollarVals = (rowText.match(/\$-?[0-9.]+/g) || []).map(s => parseFloat(s.replace("$", "")));
-
-  const tol = Math.max(0.02, Number(amount) * 0.02);
-  const withinWindow = (Date.now() - ts) < 6 * 60 * 1000;
-  const hasApproxAmount = dollarVals.some(v => Math.abs(v - Number(amount)) <= tol);
-
-  if (hasApproxAmount && withinWindow && dollarVals.length) {
-    const lastVal = dollarVals[dollarVals.length - 1];
-    return { profit: parseFloat(lastVal), ml_tag, chain_id, closed_at };
+  if (chain_id && recentTrades[chain_id]?.length) {
+    return recentTrades[chain_id][0];
   }
-  return null;
+  return lastTradeMeta;
 }
 
-// ----------------------------- Server ---------------------------------------
 const app = express();
 app.use(express.json());
 
@@ -337,7 +333,8 @@ app.post("/trade", (req, res) => {
 
 app.get("/peek", async (req, res) => {
   try {
-    const result = await peekLatestProfit();
+    const { chain_id } = req.query;
+    const result = await peekLatestProfit(chain_id);
     if (!result) return res.json({ ok: false, profit: 0, ml_tag: "", chain_id: "", closed_at: null });
     return res.json({
       ok: true,
