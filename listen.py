@@ -177,9 +177,9 @@ PO_URL = "http://localhost:3000"
 def force_otc(pair: str) -> str:
     return pair if (not FORCE_OTC or "OTC" in pair.upper()) else f"{pair} OTC"
 
-def quick_peek() -> (bool, float, str, str, Optional[str]):
+def quick_peek(chain_id: str) -> (bool, float, str, str, Optional[str]):
     try:
-        r = requests.get(f"{PO_URL}/peek", timeout=1.5)
+        r = requests.get(f"{PO_URL}/peek", params={"chain_id": chain_id}, timeout=1.5)
         if r.status_code == 200:
             j = r.json()
             return (
@@ -293,7 +293,7 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
 
             start = datetime.utcnow()
             while (datetime.utcnow() - start).total_seconds() < 2.0:
-                ok, p, tag, peek_chain, closed_at = quick_peek()
+                ok, p, tag, peek_chain, closed_at = quick_peek(cid)
                 if ok and p > 0 and peek_chain == cid:
                     if current["expected_close"]:
                         try:
@@ -301,9 +301,9 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
                         except:
                             closed_dt = None
                         if closed_dt:
-                            # Overwrite expected_close with actual closed_at from Node
-                            current["expected_close"] = closed_dt
-                            if abs((closed_dt - current["expected_close"]).total_seconds()) <= 5:
+                            # validate tolerance
+                            delta = abs((closed_dt - current["expected_close"]).total_seconds())
+                            if delta <= 5:
                                 last_win_chain = cid
                                 reset_chain(f"{label} cancelled: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
                                 return
@@ -352,7 +352,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
 
     should_block = True
     for _ in range(6):
-        ok, p, tag, peek_chain, closed_at = quick_peek()
+        ok, p, tag, peek_chain, closed_at = quick_peek(current["chain_id"] or "")
         if not ok:
             should_block = False
             break
