@@ -1,6 +1,7 @@
 # listen.py — Telegram -> PocketOption with martingale (anchored ML, tight gaps, no ghosts, chain fingerprint)
 # Patched: consumes chain_id from Node executor to ensure cancels only apply to the correct chain.
 # Added: expected_close validation so past wins can't cancel the wrong chain.
+# Refined: overwrite expected_close with closed_at from Node, ±5s tolerance.
 
 import os, re, csv, asyncio, sys, requests, emoji, uuid
 from datetime import datetime, timedelta, timezone
@@ -111,7 +112,7 @@ current = {
     "base_exec_at": None,
     "ml1_exec_at": None,
     "chain_id": None,
-    "expected_close": None  # NEW
+    "expected_close": None
 }
 last_signal_utc: Optional[datetime] = None
 seen_ids = set()
@@ -186,7 +187,7 @@ def quick_peek() -> (bool, float, str, str, Optional[str]):
                 float(j.get("profit", 0.0)),
                 j.get("ml_tag", ""),
                 j.get("chain_id", ""),
-                j.get("closed_at", None)  # must be returned by Node
+                j.get("closed_at", None)
             )
     except Exception:
         pass
@@ -299,10 +300,13 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
                             closed_dt = datetime.fromisoformat(closed_at) if closed_at else None
                         except:
                             closed_dt = None
-                        if closed_dt and abs((closed_dt - current["expected_close"]).total_seconds()) <= 10:
-                            last_win_chain = cid
-                            reset_chain(f"{label} cancelled: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
-                            return
+                        if closed_dt:
+                            # Overwrite expected_close with actual closed_at from Node
+                            current["expected_close"] = closed_dt
+                            if abs((closed_dt - current["expected_close"]).total_seconds()) <= 5:
+                                last_win_chain = cid
+                                reset_chain(f"{label} cancelled: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
+                                return
                 if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6 and last_win_chain == cid:
                     reset_chain(f"{label} cancelled: WIN ping [chain={cid}]")
                     return
