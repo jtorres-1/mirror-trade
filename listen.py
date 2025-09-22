@@ -1,4 +1,5 @@
 # listen.py — Telegram -> PocketOption with martingale (anchored ML, tight gaps, no ghosts, chain fingerprint)
+# Patched: consumes chain_id from Node executor to ensure cancels only apply to the correct chain.
 
 import os, re, csv, asyncio, sys, requests, emoji, uuid
 from datetime import datetime, timedelta, timezone
@@ -40,13 +41,13 @@ LOG_FILE = "trade_log.csv"
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", newline="") as f:
         csv.writer(f).writerow(
-            ["ts_utc","pair","direction","expiry_min","amount","result","profit","ml_tag"]
+            ["ts_utc","pair","direction","expiry_min","amount","result","profit","ml_tag","chain_id"]
         )
 
-def log_trade(pair, direction, expiry_min, amount, result, profit, ml_tag=""):
+def log_trade(pair, direction, expiry_min, amount, result, profit, ml_tag="", chain_id=""):
     with open(LOG_FILE, "a", newline="") as f:
         csv.writer(f).writerow([
-            datetime.utcnow().isoformat(), pair, direction, expiry_min, amount, result, profit, ml_tag
+            datetime.utcnow().isoformat(), pair, direction, expiry_min, amount, result, profit, ml_tag, chain_id
         ])
 
 PAIR_RE = re.compile(r'([A-Z]{3}/[A-Z]{3})', re.I)
@@ -173,19 +174,18 @@ PO_URL = "http://localhost:3000"
 def force_otc(pair: str) -> str:
     return pair if (not FORCE_OTC or "OTC" in pair.upper()) else f"{pair} OTC"
 
-def quick_peek() -> (bool, float, str):
+def quick_peek() -> (bool, float, str, str):
     try:
         r = requests.get(f"{PO_URL}/peek", timeout=1.5)
         if r.status_code == 200:
             j = r.json()
-            return bool(j.get("ok", False)), float(j.get("profit", 0.0)), j.get("ml_tag", "")
+            return bool(j.get("ok", False)), float(j.get("profit", 0.0)), j.get("ml_tag", ""), j.get("chain_id", "")
     except Exception:
         pass
-    return False, 0.0, ""
+    return False, 0.0, "", ""
 
-
-def executor_trade(pair, amount, direction, ml_tag) -> Dict:
-    payload = {"pair": pair, "amount": amount, "direction": direction.lower(), "ml_tag": ml_tag}
+def executor_trade(pair, amount, direction, ml_tag, chain_id) -> Dict:
+    payload = {"pair": pair, "amount": amount, "direction": direction.lower(), "ml_tag": ml_tag, "chain_id": chain_id}
     try:
         r = requests.post(f"{PO_URL}/trade", json=payload, timeout=400)
         if r.status_code == 200:
@@ -208,21 +208,22 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
 
     clean_pair = force_otc(pair)
     ml_tag = "BASE" if ml_label is None else f"ML{ml_label}"
+    chain_id = current["chain_id"]
 
     try:
         data = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: executor_trade(clean_pair, amount, direction, ml_tag)
+            None, lambda: executor_trade(clean_pair, amount, direction, ml_tag, chain_id)
         )
         result = data.get("result", "OPEN")
         profit = float(data.get("profit", 0))
-        log_trade(clean_pair, direction, expiry_min, amount, result, profit, ml_tag)
-        print(f"[API] Fired: {direction} {clean_pair} ${amount} [{ml_tag}] → {result}")
+        log_trade(clean_pair, direction, expiry_min, amount, result, profit, ml_tag, chain_id)
+        print(f"[API] Fired: {direction} {clean_pair} ${amount} [{ml_tag}] [chain={chain_id}] → {result}")
 
         exec_time = datetime.utcnow()
 
         # Cancel on win (base, ml1, ml2)
         if profit > 0:
-            last_win_chain = current["chain_id"]
+            last_win_chain = chain_id
             if ml_label is None:
                 cancel_task(ml1_task); ml1_task = None
                 cancel_task(ml2_task); ml2_task = None
@@ -236,7 +237,6 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
                 reset_chain(f"ML2 WIN — chain complete. [chain={last_win_chain}]")
                 return
         elif ml_label is None and profit <= 0:
-            # Base lost, clear stale win chain
             last_win_chain = None
 
         if ml_label is None:
@@ -244,7 +244,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
             base_close = exec_time + timedelta(minutes=expiry_min)
             ml1_fire = base_close + timedelta(seconds=ML1_GAP_S)
             cancel_task(ml1_task)
-            ml1_task = asyncio.create_task(schedule_leg(ml1_fire, 1, base_close, current["chain_id"]))
+            ml1_task = asyncio.create_task(schedule_leg(ml1_fire, 1, base_close, chain_id))
             print(f"[CHAIN] ML1 anchored → {ml1_fire} (gap {ML1_GAP_S:.2f}s after base close)")
             arm_ttl(base_close + timedelta(minutes=expiry_min, seconds=30), "base->ml1 span")
 
@@ -253,7 +253,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
             ml1_close = exec_time + timedelta(minutes=expiry_min)
             ml2_fire = ml1_close + timedelta(seconds=ML2_GAP_S)
             cancel_task(ml2_task)
-            ml2_task = asyncio.create_task(schedule_leg(ml2_fire, 2, ml1_close, current["chain_id"]))
+            ml2_task = asyncio.create_task(schedule_leg(ml2_fire, 2, ml1_close, chain_id))
             print(f"[CHAIN] ML2 anchored → {ml2_fire} (gap {ML2_GAP_S:.2f}s after ML1 close)")
             arm_ttl(ml1_close + timedelta(minutes=expiry_min, seconds=30), "ml1->ml2 span")
 
@@ -284,8 +284,9 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
             # re-check right before firing
             start = datetime.utcnow()
             while (datetime.utcnow() - start).total_seconds() < 2.0:
-                ok, p, tag = quick_peek()
-                if ok and p > 0 and last_win_chain == cid:
+                ok, p, tag, peek_chain = quick_peek()
+                if ok and p > 0 and peek_chain == cid:
+                    last_win_chain = cid
                     reset_chain(f"{label} cancelled: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
                     return
                 if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6 and last_win_chain == cid:
@@ -293,8 +294,9 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
                     return
                 await asyncio.sleep(0.2)
 
-            ok, p, tag = quick_peek()
-            if ok and p > 0 and last_win_chain == cid:
+            ok, p, tag, peek_chain = quick_peek()
+            if ok and p > 0 and peek_chain == cid:
+                last_win_chain = cid
                 reset_chain(f"{label} cancelled last-sec: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
                 return
 
@@ -303,7 +305,6 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
     except asyncio.CancelledError:
         print(f"[CANCEL] {label} cancelled.")
         return
-
 
 async def handle_signal_from_text(text: str, msg_date=None):
     global last_signal_utc, daily_pnl, halted_for_day, current, scheduled_tasks, last_win_ping_utc, ml1_task, ml2_task
@@ -339,7 +340,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
 
     should_block = True
     for _ in range(6):
-        ok, p, tag = quick_peek()
+        ok, p, tag, peek_chain = quick_peek()
         if not ok:
             should_block = False
             break
@@ -357,7 +358,6 @@ async def handle_signal_from_text(text: str, msg_date=None):
         print("[INFO] Chain active; ignoring new signal.")
         return True
 
-    # new fingerprint
     cid = str(uuid.uuid4())[:8]
     current.update({
         "active": True, "pair": force_otc(sig["pair"]), "direction": sig["direction"],
