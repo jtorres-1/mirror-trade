@@ -11,6 +11,7 @@
 //   8. /trade endpoint responds instantly, runs placeTrade in background (fixes ML delays)
 //   9. Tightened sleeps in overlays to 400ms
 //  10. Pair/direction cached across ML levels to skip redundant selectPair
+//  11. Patched to carry chain_id through trades, /peek, and logs
 
 const path = require("path");
 const express = require("express");
@@ -41,7 +42,7 @@ const SEL = {
 
 let context, page;
 let tradeInProgress = false;
-let lastTradeMeta = null; // { amount, ts, pair, direction, ml_tag }
+let lastTradeMeta = null; // { amount, ts, pair, direction, ml_tag, chain_id }
 let lastPairCache = null;
 let lastDirectionCache = null;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -54,7 +55,7 @@ async function withRetry(fn, attempts = 2, label = "op") {
     catch (err) {
       lastErr = err;
       console.warn(`[Retry] ${label} failed (${i + 1}/${attempts}) -> ${err?.message}`);
-      await sleep(200); // tightened retry wait
+      await sleep(200);
     }
   }
   throw lastErr;
@@ -74,7 +75,7 @@ async function forceCloseOverlays() {
       document.querySelectorAll("div.mfp-bg, div.mfp-wrap, .drop-down-modal-wrap.active").forEach(el => el.remove());
     }).catch(() => {});
 
-    await sleep(400); // tightened
+    await sleep(400);
     const stillVisible = await page.locator("div.mfp-wrap, .drop-down-modal-wrap.active").first().isVisible().catch(() => false);
     if (stillVisible) {
       console.log("[Heal] Overlay stuck — reloading page");
@@ -126,7 +127,6 @@ async function setTradeAmount(amount) {
 
 // ----------------------------- Patched selectPair ---------------------------
 async function selectPair(pair) {
-  // If cached pair matches, skip selection
   if (lastPairCache && lastPairCache.toLowerCase() === pair.toLowerCase()) {
     console.log(`[Cache] Skipping selectPair, reusing: ${pair}`);
     return;
@@ -153,7 +153,7 @@ async function selectPair(pair) {
     await forceCloseOverlays();
     await sleep(100);
 
-    lastPairCache = pair; // update cache
+    lastPairCache = pair;
   } catch (err) {
     const ts = Date.now();
     const screenshotPath = path.join(SCREEN_DIR, `selectPair_fail_${pair}_${ts}.png`);
@@ -167,23 +167,23 @@ async function selectPair(pair) {
   }
 }
 
-function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "") {
-  const header = "Time,Pair,Dir,Amount,Result,Profit,ML_Tag\n";
+function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "", chain_id = "") {
+  const header = "Time,Pair,Dir,Amount,Result,Profit,ML_Tag,Chain_ID\n";
   if (!fs.existsSync(LOG_FILE)) {
     fs.writeFileSync(LOG_FILE, header);
   }
-  fs.appendFileSync(LOG_FILE, `${ts},${pair},${dir},${amount},${result},${profit},${ml_tag}\n`);
+  fs.appendFileSync(LOG_FILE, `${ts},${pair},${dir},${amount},${result},${profit},${ml_tag},${chain_id}\n`);
 }
 
 // ----------------------------- Trade Placement ------------------------------
-async function placeTrade(pair, amount, direction, ml_tag = "") {
+async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "") {
   if (tradeInProgress) {
     console.warn("[Guard] Trade already in progress. Skipping duplicate request.");
-    return { success: false, result: "SKIPPED", profit: 0, ml_tag };
+    return { success: false, result: "SKIPPED", profit: 0, ml_tag, chain_id };
   }
   tradeInProgress = true;
 
-  console.log(`[Step] Trade request: ${direction.toUpperCase()} ${pair} $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
+  console.log(`[Step] Trade request: ${direction.toUpperCase()} ${pair} $${amount} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""}`);
   await ensurePageAlive();
   await ensureOnPO();
 
@@ -234,27 +234,27 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
     throw err;
   }
 
-  console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
+  console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""}`);
   tradeInProgress = false;
 
-  lastTradeMeta = { amount: Number(amount), ts: Date.now(), pair, direction, ml_tag }; // patched
+  lastTradeMeta = { amount: Number(amount), ts: Date.now(), pair, direction, ml_tag, chain_id };
 
   lastPairCache = pair;
   lastDirectionCache = direction;
 
   const ts = new Date().toISOString();
-  appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag);
+  appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id);
 
   (async () => {
     await sleep(305000);
-    await parseClosedTrade(amount, pair, direction, ml_tag);
+    await parseClosedTrade(amount, pair, direction, ml_tag, chain_id);
   })();
 
-  return { success: true, result: "OPEN", profit: 0, ml_tag };
+  return { success: true, result: "OPEN", profit: 0, ml_tag, chain_id };
 }
 
 // ----------------------------- Result Parser --------------------------------
-async function parseClosedTrade(amount, pair, direction, ml_tag) {
+async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") {
   let profit = 0.0, result = "LOSS";
   try {
     await page.locator(SEL.closedTab).click({ timeout: 1000 });
@@ -273,14 +273,14 @@ async function parseClosedTrade(amount, pair, direction, ml_tag) {
     console.error("[❌] Result parse failed:", err.message);
   }
   const ts2 = new Date().toISOString();
-  appendLog(ts2, pair, direction, amount, result, profit, ml_tag);
-  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""}`);
+  appendLog(ts2, pair, direction, amount, result, profit, ml_tag, chain_id);
+  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""}`);
 }
 
 // ----------------------------- Peek Endpoint --------------------------------
 async function peekLatestProfit() {
   if (!lastTradeMeta) return null;
-  const { amount, ts, ml_tag } = lastTradeMeta;
+  const { amount, ts, ml_tag, chain_id } = lastTradeMeta;
 
   await ensurePageAlive();
   try { await page.locator(SEL.closedTab).click({ timeout: 3000 }); } catch {}
@@ -297,7 +297,7 @@ async function peekLatestProfit() {
 
   if (hasApproxAmount && withinWindow && dollarVals.length) {
     const lastVal = dollarVals[dollarVals.length - 1];
-    return { profit: parseFloat(lastVal), ml_tag }; // patched: return ml_tag too
+    return { profit: parseFloat(lastVal), ml_tag, chain_id };
   }
   return null;
 }
@@ -308,16 +308,16 @@ app.use(express.json());
 
 app.post("/trade", (req, res) => {
   console.log("[REQ] Incoming trade request:", req.body);
-  const { pair, amount, direction, ml_tag } = req.body || {};
+  const { pair, amount, direction, ml_tag, chain_id } = req.body || {};
   if (!pair || !amount || !direction) {
     return res.status(400).json({ success: false, error: "pair, amount, direction required" });
   }
 
-  res.json({ success: true, result: "QUEUED", pair, amount, direction, ml_tag });
+  res.json({ success: true, result: "QUEUED", pair, amount, direction, ml_tag, chain_id });
 
   (async () => {
     try {
-      await placeTrade(pair, amount, direction, ml_tag);
+      await placeTrade(pair, amount, direction, ml_tag, chain_id);
     } catch (err) {
       console.error("[❌] Background trade failed:", err);
     }
@@ -327,10 +327,10 @@ app.post("/trade", (req, res) => {
 app.get("/peek", async (req, res) => {
   try {
     const result = await peekLatestProfit();
-    if (!result) return res.json({ ok: false, profit: 0, ml_tag: "" });
-    return res.json({ ok: true, profit: result.profit, ml_tag: result.ml_tag || "" });
+    if (!result) return res.json({ ok: false, profit: 0, ml_tag: "", chain_id: "" });
+    return res.json({ ok: true, profit: result.profit, ml_tag: result.ml_tag || "", chain_id: result.chain_id || "" });
   } catch (err) {
-    return res.json({ ok: false, error: err?.message || String(err), profit: 0, ml_tag: "" });
+    return res.json({ ok: false, error: err?.message || String(err), profit: 0, ml_tag: "", chain_id: "" });
   }
 });
 
