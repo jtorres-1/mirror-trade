@@ -268,14 +268,14 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
             arm_ttl(ml1_close + timedelta(minutes=expiry_min, seconds=30), "ml1->ml2 span")
 
         elif ml_label == 2:
-            ml2_close = exec_time + timedelta(minutes=expiry_min)
-            arm_ttl(ml2_close + timedelta(seconds=30), "ml2 close")
+            if profit > 0:
+                reset_chain(f"ML2 WIN — chain complete. [chain={last_win_chain}]")
+                return
+            else:
+                reset_chain(f"ML2 LOSS — chain complete. [chain={chain_id}]")
+                return
     finally:
         executor_busy = False
-
-    if ml_label == 2:
-        print("[DONE] ML2 placed. Freeing chain for next signal.")
-        reset_chain("ML2 placed; chain released.")
 
 # ── Scheduling with guard (patched) ──────────────────────────────
 async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: Optional[datetime] = None, cid: Optional[str] = None):
@@ -301,7 +301,6 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
                         except:
                             closed_dt = None
                         if closed_dt:
-                            # validate tolerance
                             delta = abs((closed_dt - current["expected_close"]).total_seconds())
                             if delta <= 5:
                                 last_win_chain = cid
