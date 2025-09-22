@@ -1,5 +1,6 @@
 # listen.py — Telegram -> PocketOption with martingale (anchored ML, tight gaps, no ghosts, chain fingerprint)
 # Patched: consumes chain_id from Node executor to ensure cancels only apply to the correct chain.
+# Added: expected_close validation so past wins can't cancel the wrong chain.
 
 import os, re, csv, asyncio, sys, requests, emoji, uuid
 from datetime import datetime, timedelta, timezone
@@ -109,7 +110,8 @@ current = {
     "amount": base_amount,
     "base_exec_at": None,
     "ml1_exec_at": None,
-    "chain_id": None
+    "chain_id": None,
+    "expected_close": None  # NEW
 }
 last_signal_utc: Optional[datetime] = None
 seen_ids = set()
@@ -160,7 +162,7 @@ def reset_chain(reason=""):
         "active": False, "pair": None, "direction": None,
         "expiry_min": 5, "amount": base_amount,
         "base_exec_at": None, "ml1_exec_at": None,
-        "chain_id": None
+        "chain_id": None, "expected_close": None
     })
     if reason: print(f"[RESET] {reason}")
     else:      print("[RESET] Chain cleared.")
@@ -174,15 +176,21 @@ PO_URL = "http://localhost:3000"
 def force_otc(pair: str) -> str:
     return pair if (not FORCE_OTC or "OTC" in pair.upper()) else f"{pair} OTC"
 
-def quick_peek() -> (bool, float, str, str):
+def quick_peek() -> (bool, float, str, str, Optional[str]):
     try:
         r = requests.get(f"{PO_URL}/peek", timeout=1.5)
         if r.status_code == 200:
             j = r.json()
-            return bool(j.get("ok", False)), float(j.get("profit", 0.0)), j.get("ml_tag", ""), j.get("chain_id", "")
+            return (
+                bool(j.get("ok", False)),
+                float(j.get("profit", 0.0)),
+                j.get("ml_tag", ""),
+                j.get("chain_id", ""),
+                j.get("closed_at", None)  # must be returned by Node
+            )
     except Exception:
         pass
-    return False, 0.0, "", ""
+    return False, 0.0, "", "", None
 
 def executor_trade(pair, amount, direction, ml_tag, chain_id) -> Dict:
     payload = {"pair": pair, "amount": amount, "direction": direction.lower(), "ml_tag": ml_tag, "chain_id": chain_id}
@@ -220,8 +228,9 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
         print(f"[API] Fired: {direction} {clean_pair} ${amount} [{ml_tag}] [chain={chain_id}] → {result}")
 
         exec_time = datetime.utcnow()
+        current["expected_close"] = exec_time + timedelta(minutes=expiry_min)
 
-        # Cancel on win (base, ml1, ml2)
+        # Cancel on win
         if profit > 0:
             last_win_chain = chain_id
             if ml_label is None:
@@ -267,7 +276,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
         print("[DONE] ML2 placed. Freeing chain for next signal.")
         reset_chain("ML2 placed; chain released.")
 
-# ── Scheduling with guard ─────────────────────────────────────────────────────
+# ── Scheduling with guard (patched) ──────────────────────────────
 async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: Optional[datetime] = None, cid: Optional[str] = None):
     label = "BASE" if ml_label is None else f"ML{ml_label}"
     delay = max(0.0, (fire_dt - datetime.utcnow()).total_seconds())
@@ -281,24 +290,23 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
                 while datetime.utcnow() < prev_close:
                     await asyncio.sleep(0.1)
 
-            # re-check right before firing
             start = datetime.utcnow()
             while (datetime.utcnow() - start).total_seconds() < 2.0:
-                ok, p, tag, peek_chain = quick_peek()
+                ok, p, tag, peek_chain, closed_at = quick_peek()
                 if ok and p > 0 and peek_chain == cid:
-                    last_win_chain = cid
-                    reset_chain(f"{label} cancelled: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
-                    return
+                    if current["expected_close"]:
+                        try:
+                            closed_dt = datetime.fromisoformat(closed_at) if closed_at else None
+                        except:
+                            closed_dt = None
+                        if closed_dt and abs((closed_dt - current["expected_close"]).total_seconds()) <= 10:
+                            last_win_chain = cid
+                            reset_chain(f"{label} cancelled: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
+                            return
                 if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6 and last_win_chain == cid:
                     reset_chain(f"{label} cancelled: WIN ping [chain={cid}]")
                     return
                 await asyncio.sleep(0.2)
-
-            ok, p, tag, peek_chain = quick_peek()
-            if ok and p > 0 and peek_chain == cid:
-                last_win_chain = cid
-                reset_chain(f"{label} cancelled last-sec: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
-                return
 
         amt = base_amount if ml_label is None else min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
         await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=ml_label)
@@ -340,7 +348,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
 
     should_block = True
     for _ in range(6):
-        ok, p, tag, peek_chain = quick_peek()
+        ok, p, tag, peek_chain, closed_at = quick_peek()
         if not ok:
             should_block = False
             break
@@ -362,7 +370,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
     current.update({
         "active": True, "pair": force_otc(sig["pair"]), "direction": sig["direction"],
         "expiry_min": sig["expiry_min"], "amount": base_amount,
-        "base_exec_at": None, "ml1_exec_at": None, "chain_id": cid
+        "base_exec_at": None, "ml1_exec_at": None, "chain_id": cid, "expected_close": None
     })
     last_signal_utc = now_utc
     print(f"[SIGNAL] {current['pair']} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} [chain={cid}]")
