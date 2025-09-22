@@ -232,7 +232,7 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", e
   appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id, "");
 
   (async () => {
-    await sleep(expiration * 1000);  // Changed to 300s
+    await sleep(expiration * 1000);  // 300s
     await parseClosedTrade(amount, pair, direction, ml_tag, chain_id);
   })();
 
@@ -255,8 +255,8 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
   try {
     await page.locator(SEL.closedTab).click({ timeout: 1000 });
     const row = page.locator(SEL.closedRow).first();
-    await row.waitFor({ state: "visible", timeout: 2000 });
-    const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
+    await row.waitFor({ state: "visible", timeout: 5000 }); // Increased to 5000ms
+    let rowText = (await row.innerText()).replace(/\n/g, " ").trim();
     console.log(`[Debug] Closed row text: ${rowText}`);
 
     const profitMatches = rowText.match(/\$-?[0-9.]+/g);
@@ -264,6 +264,17 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
       const lastVal = profitMatches[profitMatches.length - 1];
       profit = parseFloat(lastVal.replace("$", ""));
       result = profit > 0 ? "WIN" : "LOSS";
+    }
+
+    // Retry if profit is 0 to catch delayed updates (e.g., ML2 win)
+    if (profit === 0) {
+      await sleep(1000);
+      rowText = (await row.innerText()).replace(/\n/g, " ").trim();
+      const retryMatches = rowText.match(/\$-?[0-9.]+/g);
+      if (retryMatches?.length) {
+        profit = parseFloat(retryMatches[retryMatches.length - 1].replace("$", ""));
+        result = profit > 0 ? "WIN" : "LOSS";
+      }
     }
 
     const timeMatch = rowText.match(/\d{2}:\d{2}/);
