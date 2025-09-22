@@ -232,7 +232,7 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", e
   appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id, "");
 
   (async () => {
-    await sleep(expiration * 1000 + 1000);  // Shortened to 301s (300s + 1s buffer)
+    await sleep(expiration * 1000);  // Changed to 300s
     await parseClosedTrade(amount, pair, direction, ml_tag, chain_id);
   })();
 
