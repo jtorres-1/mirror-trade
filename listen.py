@@ -1,7 +1,7 @@
 # listen.py — Telegram -> PocketOption with martingale (anchored ML, tight gaps, no ghosts, chain fingerprint)
 # Patched: consumes chain_id from Node executor to ensure cancels only apply to the correct chain.
 # Added: expected_close validation so past wins can't cancel the wrong chain.
-# Refined: overwrite expected_close with closed_at from Node, ±5s tolerance.
+# Refined: overwrite expected_close with closed_at from Node, ±7s tolerance. [Updated]
 # Fixed: guard now skips /peek if no active chain_id, preventing stale-blocks.
 
 import os, re, csv, asyncio, sys, requests, emoji, uuid
@@ -207,7 +207,7 @@ def executor_trade(pair, amount, direction, ml_tag, chain_id) -> Dict:
             print(f"[API ERROR] {r.status_code}: {r.text}")
     except Exception as e:
         print(f"[API EXCEPTION] {e}")
-    return {"success": False, "result": "OPEN", "profit": 0}
+    return {"success": false, "result": "OPEN", "profit": 0}
 
 async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> None:
     global executor_busy, daily_pnl, halted_for_day, ml1_task, ml2_task, last_win_chain
@@ -305,20 +305,17 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
         await asyncio.sleep(delay)
 
         if ml_label in (1, 2):
-            if prev_close:
-                while datetime.utcnow() < prev_close:
-                    await asyncio.sleep(0.1)
-
-            # Asynchronous WIN check (non-blocking)
+            # Removed while datetime.utcnow() < prev_close loop
+            # Asynchronous WIN check (non-blocking, reduced to 3s)
             async def check_win():
                 start = datetime.utcnow()
-                while (datetime.utcnow() - start).total_seconds() < 5.0:
+                while (datetime.utcnow() - start).total_seconds() < 3.0:  # Reduced from 5.0
                     ok, p, tag, peek_chain, closed_at = quick_peek(cid)
                     if ok and p > 0 and peek_chain == cid:
                         if current["expected_close"]:
                             try:
                                 closed_dt = datetime.fromisoformat(closed_at) if closed_at else None
-                                if closed_dt and abs((closed_dt - current["expected_close"]).total_seconds()) <= 5:
+                                if closed_dt and abs((closed_dt - current["expected_close"]).total_seconds()) <= 7:  # Increased to ±7s
                                     last_win_chain = cid
                                     reset_chain(f"{label} cancelled: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
                                     return True
@@ -381,7 +378,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
                 if p > 0:
                     last_win_chain = cid
                     reset_chain(f"WIN detected via /peek (profit {p}, tag={tag}) [chain={cid}]")
-                should_block = False
+                should_block = false
                 break
             await asyncio.sleep(0.2)
         if should_block:
