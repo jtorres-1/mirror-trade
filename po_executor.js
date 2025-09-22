@@ -12,6 +12,7 @@
 //   9. Tightened sleeps in overlays to 400ms
 //  10. Pair/direction cached across ML levels to skip redundant selectPair
 //  11. Patched to carry chain_id through trades, /peek, and logs
+//  12. Added closed_at timestamp capture in parseClosedTrade and /peek
 
 const path = require("path");
 const express = require("express");
@@ -42,7 +43,7 @@ const SEL = {
 
 let context, page;
 let tradeInProgress = false;
-let lastTradeMeta = null; // { amount, ts, pair, direction, ml_tag, chain_id }
+let lastTradeMeta = null; // { amount, ts, pair, direction, ml_tag, chain_id, closed_at }
 let lastPairCache = null;
 let lastDirectionCache = null;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -167,12 +168,12 @@ async function selectPair(pair) {
   }
 }
 
-function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "", chain_id = "") {
-  const header = "Time,Pair,Dir,Amount,Result,Profit,ML_Tag,Chain_ID\n";
+function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "", chain_id = "", closed_at = "") {
+  const header = "Time,Pair,Dir,Amount,Result,Profit,ML_Tag,Chain_ID,Closed_At\n";
   if (!fs.existsSync(LOG_FILE)) {
     fs.writeFileSync(LOG_FILE, header);
   }
-  fs.appendFileSync(LOG_FILE, `${ts},${pair},${dir},${amount},${result},${profit},${ml_tag},${chain_id}\n`);
+  fs.appendFileSync(LOG_FILE, `${ts},${pair},${dir},${amount},${result},${profit},${ml_tag},${chain_id},${closed_at}\n`);
 }
 
 // ----------------------------- Trade Placement ------------------------------
@@ -237,14 +238,14 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "") {
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""}`);
   tradeInProgress = false;
 
-  lastTradeMeta = { amount: Number(amount), ts: Date.now(), pair, direction, ml_tag, chain_id };
+  lastTradeMeta = { amount: Number(amount), ts: Date.now(), pair, direction, ml_tag, chain_id, closed_at: null };
 
   lastPairCache = pair;
   lastDirectionCache = direction;
 
   const ts = new Date().toISOString();
-  appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id);
-
+  appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id, "");
+  
   (async () => {
     await sleep(305000);
     await parseClosedTrade(amount, pair, direction, ml_tag, chain_id);
@@ -255,7 +256,7 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "") {
 
 // ----------------------------- Result Parser --------------------------------
 async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") {
-  let profit = 0.0, result = "LOSS";
+  let profit = 0.0, result = "LOSS", closed_at = new Date().toISOString();
   try {
     await page.locator(SEL.closedTab).click({ timeout: 1000 });
     const row = page.locator(SEL.closedRow).first();
@@ -269,18 +270,28 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
       profit = parseFloat(lastVal.replace("$", ""));
       result = profit > 0 ? "WIN" : "LOSS";
     }
+
+    // patch: extract closed_at timestamp from rowText if available
+    const timeMatch = rowText.match(/\d{2}:\d{2}/);
+    if (timeMatch) {
+      const now = new Date();
+      closed_at = new Date(now.toDateString() + " " + timeMatch[0] + " UTC").toISOString();
+    }
   } catch (err) {
     console.error("[❌] Result parse failed:", err.message);
   }
+
+  lastTradeMeta = { ...lastTradeMeta, closed_at };
+
   const ts2 = new Date().toISOString();
-  appendLog(ts2, pair, direction, amount, result, profit, ml_tag, chain_id);
-  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""}`);
+  appendLog(ts2, pair, direction, amount, result, profit, ml_tag, chain_id, closed_at);
+  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""} closed_at=${closed_at}`);
 }
 
 // ----------------------------- Peek Endpoint --------------------------------
 async function peekLatestProfit() {
   if (!lastTradeMeta) return null;
-  const { amount, ts, ml_tag, chain_id } = lastTradeMeta;
+  const { amount, ts, ml_tag, chain_id, closed_at } = lastTradeMeta;
 
   await ensurePageAlive();
   try { await page.locator(SEL.closedTab).click({ timeout: 3000 }); } catch {}
@@ -297,7 +308,7 @@ async function peekLatestProfit() {
 
   if (hasApproxAmount && withinWindow && dollarVals.length) {
     const lastVal = dollarVals[dollarVals.length - 1];
-    return { profit: parseFloat(lastVal), ml_tag, chain_id };
+    return { profit: parseFloat(lastVal), ml_tag, chain_id, closed_at };
   }
   return null;
 }
@@ -328,13 +339,12 @@ app.get("/peek", async (req, res) => {
   try {
     const result = await peekLatestProfit();
     if (!result) return res.json({ ok: false, profit: 0, ml_tag: "", chain_id: "", closed_at: null });
-
     return res.json({
       ok: true,
       profit: result.profit,
       ml_tag: result.ml_tag || "",
       chain_id: result.chain_id || "",
-      closed_at: new Date().toISOString()   // 👈 add this line
+      closed_at: result.closed_at || null
     });
   } catch (err) {
     return res.json({
@@ -347,7 +357,6 @@ app.get("/peek", async (req, res) => {
     });
   }
 });
-
 
 // ----------------------------- Browser Init ---------------------------------
 async function initBrowser() {
