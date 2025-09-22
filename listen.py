@@ -27,9 +27,9 @@ mg_mult         = float(os.getenv("MARTINGALE_MULT", "2.2"))
 MAX_STAKE       = float(os.getenv("MAX_STAKE", "10.65"))
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
 
-SKEW_MS       = int(os.getenv("SKEW_MS", "4200"))
-ML1_GAP_S     = float(os.getenv("ML1_GAP_S", "2"))
-ML2_GAP_S     = float(os.getenv("ML2_GAP_S", "2"))
+SKEW_MS       = int(os.getenv("SKEW_MS", "2380"))
+ML1_GAP_S     = float(os.getenv("ML1_GAP_S", "1"))  # Updated to 1 second
+ML2_GAP_S     = float(os.getenv("ML2_GAP_S", "0.25"))  # Updated to 0.25 seconds
 
 if not api_id or not api_hash:
     print("[FATAL] API_ID/API_HASH missing in .env"); sys.exit(1)
@@ -195,7 +195,10 @@ def quick_peek(chain_id: str) -> (bool, float, str, str, Optional[str]):
     return False, 0.0, "", "", None
 
 def executor_trade(pair, amount, direction, ml_tag, chain_id) -> Dict:
-    payload = {"pair": pair, "amount": amount, "direction": direction.lower(), "ml_tag": ml_tag, "chain_id": chain_id}
+    payload = {
+        "pair": pair, "amount": amount, "direction": direction.lower(),
+        "ml_tag": ml_tag, "chain_id": chain_id, "expiration": current["expiry_min"] * 60
+    }
     try:
         r = requests.post(f"{PO_URL}/trade", json=payload, timeout=400)
         if r.status_code == 200:
@@ -231,6 +234,20 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
 
         exec_time = datetime.utcnow()
         current["expected_close"] = exec_time + timedelta(minutes=expiry_min)
+
+        # Poll /peek to update expected_close
+        start = datetime.utcnow()
+        while (datetime.utcnow() - start).total_seconds() < 5.0:
+            ok, p, tag, peek_chain, closed_at = quick_peek(chain_id)
+            if ok and peek_chain == chain_id and closed_at:
+                try:
+                    closed_dt = datetime.fromisoformat(closed_at)
+                    current["expected_close"] = closed_dt
+                    print(f"[UPDATE] expected_close set to {closed_dt} from /peek [chain={chain_id}]")
+                    break
+                except:
+                    pass
+            await asyncio.sleep(0.2)
 
         # Cancel on win
         if profit > 0:
@@ -292,25 +309,27 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
                 while datetime.utcnow() < prev_close:
                     await asyncio.sleep(0.1)
 
-            start = datetime.utcnow()
-            while (datetime.utcnow() - start).total_seconds() < 2.0:
-                ok, p, tag, peek_chain, closed_at = quick_peek(cid)
-                if ok and p > 0 and peek_chain == cid:
-                    if current["expected_close"]:
-                        try:
-                            closed_dt = datetime.fromisoformat(closed_at) if closed_at else None
-                        except:
-                            closed_dt = None
-                        if closed_dt:
-                            delta = abs((closed_dt - current["expected_close"]).total_seconds())
-                            if delta <= 5:
-                                last_win_chain = cid
-                                reset_chain(f"{label} cancelled: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
-                                return
-                if (not ok) and last_win_ping_utc and (datetime.utcnow() - last_win_ping_utc).total_seconds() <= 6 and last_win_chain == cid:
-                    reset_chain(f"{label} cancelled: WIN ping [chain={cid}]")
-                    return
-                await asyncio.sleep(0.2)
+            # Asynchronous WIN check (non-blocking)
+            async def check_win():
+                start = datetime.utcnow()
+                while (datetime.utcnow() - start).total_seconds() < 5.0:
+                    ok, p, tag, peek_chain, closed_at = quick_peek(cid)
+                    if ok and p > 0 and peek_chain == cid:
+                        if current["expected_close"]:
+                            try:
+                                closed_dt = datetime.fromisoformat(closed_at) if closed_at else None
+                                if closed_dt and abs((closed_dt - current["expected_close"]).total_seconds()) <= 5:
+                                    last_win_chain = cid
+                                    reset_chain(f"{label} cancelled: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
+                                    return True
+                            except:
+                                pass
+                    await asyncio.sleep(0.2)
+                return False
+
+            win_detected = await check_win()
+            if win_detected:
+                return
 
         amt = base_amount if ml_label is None else min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
         await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=ml_label)
@@ -356,23 +375,23 @@ async def handle_signal_from_text(text: str, msg_date=None):
     if not cid:  # no active chain, nothing to block
         should_block = False
     else:
-        for _ in range(6):
+        for _ in range(15):  # 3s total (15 retries x 0.2s)
             ok, p, tag, peek_chain, closed_at = quick_peek(cid)
-            if not ok:
-                should_block = False
-                break
-            if p != 0:
+            if not ok or p != 0:
                 if p > 0:
-                    last_win_ping_utc = datetime.utcnow()
+                    last_win_chain = cid
+                    reset_chain(f"WIN detected via /peek (profit {p}, tag={tag}) [chain={cid}]")
                 should_block = False
                 break
             await asyncio.sleep(0.2)
+        if should_block:
+            reset_chain(f"Forced reset: /peek unresolved for chain {cid}")
+            should_block = False
+    # ─────────────────────────────────────────────────────────────────────
 
     if should_block:
         print("[GUARD] Skipping new BASE: unresolved trade still open.")
         return True
-    # ─────────────────────────────────────────────────────────────────────
-
     if current["active"]:
         print("[INFO] Chain active; ignoring new signal.")
         return True
