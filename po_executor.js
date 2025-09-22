@@ -1,20 +1,3 @@
-// po_executor.js — Executor with instant OPEN + background result parse
-// Optimized: Caches lastPair/lastDirection across ML levels to save time
-// Fixes:
-//   1. Added /peek endpoint so Python can cancel ML legs on WIN
-//   2. Result parser matches trade by amount + close time window
-//   3. Keeps selectPair, setTradeAmount, overlays, retries intact
-//   4. forceCloseOverlays handles both asset dropdowns + Magnific popups
-//   5. Screenshot on failed clicks for instant debugging
-//   6. Screenshot on selectPair failure for instant debugging
-//   7. Hard overlay nuke (conditional) before selecting pair
-//   8. /trade endpoint responds instantly, runs placeTrade in background (fixes ML delays)
-//   9. Tightened sleeps in overlays to 400ms
-//  10. Pair/direction cached across ML levels to skip redundant selectPair
-//  11. Patched to carry chain_id through trades, /peek, and logs
-//  12. Added closed_at timestamp capture in parseClosedTrade and /peek
-//  13. NEW: recentTrades buffer keyed by chain_id, so /peek is chain-specific
-
 const path = require("path");
 const express = require("express");
 const { chromium } = require("playwright");
@@ -179,7 +162,7 @@ function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "", chain_id 
 }
 
 // ----------------------------- Trade Placement ------------------------------
-async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "") {
+async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", expiration = 300) {
   if (tradeInProgress) {
     console.warn("[Guard] Trade already in progress. Skipping duplicate request.");
     return { success: false, result: "SKIPPED", profit: 0, ml_tag, chain_id };
@@ -247,9 +230,9 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "") {
 
   const ts = new Date().toISOString();
   appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id, "");
-  
+
   (async () => {
-    await sleep(305000);
+    await sleep(expiration * 1000 + 5000);  // Adjusted to expiration + 5s buffer
     await parseClosedTrade(amount, pair, direction, ml_tag, chain_id);
   })();
 
@@ -262,6 +245,7 @@ function recordClosedTrade(meta) {
   if (!chain_id) return;
   if (!recentTrades[chain_id]) recentTrades[chain_id] = [];
   recentTrades[chain_id].unshift(meta);
+  recentTrades[chain_id] = recentTrades[chain_id].filter(t => Date.now() - new Date(t.closed_at).getTime() < 600000); // 10min TTL
   if (recentTrades[chain_id].length > 5) recentTrades[chain_id].pop();
   lastTradeMeta = meta;
 }
@@ -315,7 +299,7 @@ app.use(express.json());
 
 app.post("/trade", (req, res) => {
   console.log("[REQ] Incoming trade request:", req.body);
-  const { pair, amount, direction, ml_tag, chain_id } = req.body || {};
+  const { pair, amount, direction, ml_tag, chain_id, expiration } = req.body || {};
   if (!pair || !amount || !direction) {
     return res.status(400).json({ success: false, error: "pair, amount, direction required" });
   }
@@ -324,7 +308,7 @@ app.post("/trade", (req, res) => {
 
   (async () => {
     try {
-      await placeTrade(pair, amount, direction, ml_tag, chain_id);
+      await placeTrade(pair, amount, direction, ml_tag, chain_id, expiration);
     } catch (err) {
       console.error("[❌] Background trade failed:", err);
     }
