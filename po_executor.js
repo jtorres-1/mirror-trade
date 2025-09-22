@@ -327,12 +327,27 @@ app.post("/trade", (req, res) => {
 app.get("/peek", async (req, res) => {
   try {
     const result = await peekLatestProfit();
-    if (!result) return res.json({ ok: false, profit: 0, ml_tag: "", chain_id: "" });
-    return res.json({ ok: true, profit: result.profit, ml_tag: result.ml_tag || "", chain_id: result.chain_id || "" });
+    if (!result) return res.json({ ok: false, profit: 0, ml_tag: "", chain_id: "", closed_at: null });
+
+    return res.json({
+      ok: true,
+      profit: result.profit,
+      ml_tag: result.ml_tag || "",
+      chain_id: result.chain_id || "",
+      closed_at: new Date().toISOString()   // 👈 add this line
+    });
   } catch (err) {
-    return res.json({ ok: false, error: err?.message || String(err), profit: 0, ml_tag: "", chain_id: "" });
+    return res.json({
+      ok: false,
+      error: err?.message || String(err),
+      profit: 0,
+      ml_tag: "",
+      chain_id: "",
+      closed_at: null
+    });
   }
 });
+
 
 // ----------------------------- Browser Init ---------------------------------
 async function initBrowser() {
