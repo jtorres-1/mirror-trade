@@ -1,4 +1,4 @@
-// po_executor.js — Executor with robust closed-trade parsing (DOM-based, stateless)
+// po_executor.js  Executor with live Closed tab scraping for /peek
 
 const path = require("path");
 const express = require("express");
@@ -25,8 +25,8 @@ const SEL = {
 
   closedTab: 'li:has-text("Closed")',
   closedRow: '.deals-list__item',
-  directionUp: 'i.fa.fa-arrow-up',   // Buy/Call
-  directionDown: 'i.fa.fa-arrow-down', // Sell/Put
+  directionUp: 'i.fa.fa-arrow-up',
+  directionDown: 'i.fa.fa-arrow-down',
   profitCell: '.centered'
 };
 
@@ -35,9 +35,12 @@ let tradeInProgress = false;
 let recentTrades = {};
 let lastPairCache = null;
 
+// remembers the most recent placed trade params per chain
+// used by /peek to scrape the correct row
+const expectedByChain = Object.create(null);
+
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// ----------------------------- Utilities ------------------------------------
 async function withRetry(fn, attempts = 2, label = "op") {
   let lastErr;
   for (let i = 0; i < attempts; i++) {
@@ -68,7 +71,7 @@ async function forceCloseOverlays() {
     await sleep(400);
     const stillVisible = await page.locator("div.mfp-wrap, .drop-down-modal-wrap.active").first().isVisible().catch(() => false);
     if (stillVisible) {
-      console.log("[Heal] Overlay stuck — reloading page");
+      console.log("[Heal] Overlay stuck, reloading page");
       await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
       await ensureOnPO();
     }
@@ -81,7 +84,7 @@ async function ensureOnPO() {
   if (!page || page.isClosed()) throw new Error("No page");
   const url = page.url() || "";
   if (!url.includes("pocketoption.com")) {
-    console.log("[Nav] Navigating to PocketOption trade page…");
+    console.log("[Nav] Navigating to PocketOption trade page");
     await page.goto(PO_URL_TRADE, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
   }
   await withRetry(async () => { await waitForTradePanel(); }, 2, "wait trade panel");
@@ -89,13 +92,13 @@ async function ensureOnPO() {
 
 async function ensurePageAlive() {
   if (!page || page.isClosed()) {
-    console.log("[Heal] Page closed. Restarting browser…");
+    console.log("[Heal] Page closed. Restarting browser");
     await initBrowser();
     return;
   }
   const panelVisible = await page.locator(SEL.tradePanel).first().isVisible().catch(() => false);
   if (!panelVisible) {
-    console.log("[Heal] Trade panel not visible. Reloading…");
+    console.log("[Heal] Trade panel not visible. Reloading");
     await page.reload({ waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT }).catch(() => {});
     await ensureOnPO();
   }
@@ -115,7 +118,6 @@ async function setTradeAmount(amount) {
   await page.keyboard.type(String(amount)).catch(() => {});
 }
 
-// ----------------------------- Pair Selection -------------------------------
 async function selectPair(pair) {
   if (lastPairCache && lastPairCache.toLowerCase() === pair.toLowerCase()) {
     console.log(`[Cache] Skipping selectPair, reusing: ${pair}`);
@@ -165,7 +167,6 @@ function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "", chain_id 
   fs.appendFileSync(LOG_FILE, `${ts},${pair},${dir},${amount},${result},${profit},${ml_tag},${chain_id},${closed_at}\n`);
 }
 
-// ----------------------------- Result Parser --------------------------------
 function recordClosedTrade(meta) {
   const { chain_id } = meta;
   if (!chain_id) return;
@@ -181,16 +182,17 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
     await page.locator(SEL.closedTab).click({ timeout: 2000 });
     await page.waitForTimeout(500);
 
-    let rows = await page.locator(SEL.closedRow).all();
-    for (let row of rows) {
+    const rows = await page.locator(SEL.closedRow).all();
+    for (const row of rows) {
       const text = await row.innerText();
-      if (!text.includes(pair)) continue;
-      if (!text.includes(String(amount))) continue;
+
+      if (pair && !text.includes(pair)) continue;
+      if (amount && !text.includes(String(amount))) continue;
 
       let detectedDirection = null;
       if (await row.locator(SEL.directionUp).count() > 0) detectedDirection = "BUY";
       if (await row.locator(SEL.directionDown).count() > 0) detectedDirection = "SELL";
-      if (detectedDirection && detectedDirection !== direction.toUpperCase()) continue;
+      if (detectedDirection && direction && detectedDirection !== direction.toUpperCase()) continue;
 
       const profitNode = row.locator(SEL.profitCell).last();
       let profitText = await profitNode.innerText();
@@ -222,7 +224,6 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
   return meta;
 }
 
-// ----------------------------- Trade Placement ------------------------------
 async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", expiration = 300) {
   if (tradeInProgress) {
     console.warn("[Guard] Trade already in progress. Skipping duplicate request.");
@@ -230,47 +231,59 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", e
   }
   tradeInProgress = true;
 
-  console.log(`[Step] Trade request: ${direction.toUpperCase()} ${pair} $${amount} [${ml_tag}] [chain=${chain_id}]`);
-  await ensurePageAlive();
-  await ensureOnPO();
-  await forceCloseOverlays();
+  try {
+    console.log(`[Step] Trade request: ${direction.toUpperCase()} ${pair} $${amount} [${ml_tag}] [chain=${chain_id}]`);
+    await ensurePageAlive();
+    await ensureOnPO();
+    await forceCloseOverlays();
 
-  await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
-  await withRetry(async () => { await setTradeAmount(amount); }, 2, "setTradeAmount");
+    await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
+    await withRetry(async () => { await setTradeAmount(amount); }, 2, "setTradeAmount");
 
-  const panel = page.locator(SEL.tradePanel).first();
-  const btn = direction.toLowerCase() === 'buy'
-    ? panel.locator(SEL.buyBtn).first()
-    : panel.locator(SEL.sellBtn).first();
+    const panel = page.locator(SEL.tradePanel).first();
+    const btn = direction.toLowerCase() === 'buy'
+      ? panel.locator(SEL.buyBtn).first()
+      : panel.locator(SEL.sellBtn).first();
 
-  await btn.scrollIntoViewIfNeeded().catch(() => {});
-  await btn.waitFor({ state: 'visible', timeout: DEFAULT_TIMEOUT });
-  console.log(`[CLICK] ${direction.toUpperCase()} button for ${pair} @ $${amount}`);
+    await btn.scrollIntoViewIfNeeded().catch(() => {});
+    await btn.waitFor({ state: 'visible', timeout: DEFAULT_TIMEOUT });
+    console.log(`[CLICK] ${direction.toUpperCase()} button for ${pair} @ $${amount}`);
 
-  await btn.click({ timeout: DEFAULT_TIMEOUT, force: true }).catch(err => {
-    console.error("[❌] Button click failed:", err.message);
-  });
+    await btn.click({ timeout: DEFAULT_TIMEOUT, force: true }).catch(err => {
+      console.error("[❌] Button click failed:", err.message);
+    });
 
-  tradeInProgress = false;
+    // remember the most recent placed trade for this chain
+    if (chain_id) {
+      expectedByChain[chain_id] = { amount, pair, direction, ml_tag };
+    }
 
-  const ts = new Date().toISOString();
-  appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id, "");
+    const ts = new Date().toISOString();
+    appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id, "");
 
-  return { success: true, result: "OPEN", profit: 0, ml_tag, chain_id };
+    return { success: true, result: "OPEN", profit: 0, ml_tag, chain_id };
+  } finally {
+    tradeInProgress = false;
+  }
 }
 
-// ----------------------------- Peek Endpoint --------------------------------
 async function peekLatestProfit(chain_id = null) {
   await ensurePageAlive();
   try { await page.locator(SEL.closedTab).click({ timeout: 3000 }); } catch {}
 
-  if (chain_id && recentTrades[chain_id]?.length) {
-    return recentTrades[chain_id][0];
+  if (!chain_id) return null;
+  const expected = expectedByChain[chain_id];
+  if (!expected) {
+    // we do not know what to look for yet
+    return null;
   }
-  return null;
+
+  // scrape live Closed tab for the exact trade referenced by this chain
+  const { amount, pair, direction, ml_tag } = expected;
+  const meta = await parseClosedTrade(amount, pair, direction, ml_tag, chain_id);
+  return meta || null;
 }
 
-// ----------------------------- Express API ---------------------------------
 const app = express();
 app.use(express.json());
 
@@ -300,9 +313,8 @@ app.get("/peek", async (req, res) => {
   }
 });
 
-// ----------------------------- Browser Init ---------------------------------
 async function initBrowser() {
-  console.log("[Init] Launching PocketOption…");
+  console.log("[Init] Launching PocketOption");
   const browser = await chromium.launch({ headless: HEADLESS, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
   context = await browser.newContext({ storageState: "po_storage.json" });
   page = await context.newPage();
@@ -310,7 +322,7 @@ async function initBrowser() {
 
   await page.goto(PO_URL_TRADE, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
   await ensureOnPO();
-  console.log("[Init] PocketOption ready.");
+  console.log("[Init] PocketOption ready");
 }
 
 app.listen(3000, async () => {
