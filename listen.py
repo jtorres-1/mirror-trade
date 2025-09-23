@@ -1,4 +1,5 @@
-# listen.py — Telegram -> PocketOption with martingale (anchored ML, tight gaps, no ghosts, chain fingerprint)
+# listen.py — Telegram -> PocketOption with martingale
+# Outcome-anchored, hybrid wait (sleep-then-poll), no time-based races, no stale wins
 
 import os, re, csv, asyncio, sys, requests, emoji, uuid
 from datetime import datetime, timedelta, timezone
@@ -23,9 +24,13 @@ mg_mult         = float(os.getenv("MARTINGALE_MULT", "2.2"))
 MAX_STAKE       = float(os.getenv("MAX_STAKE", "10.65"))
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
 
-SKEW_MS   = int(os.getenv("SKEW_MS", "2380"))      # base fires ~2.3s early
-ML1_GAP_S = float(os.getenv("ML1_GAP_S", "1.0"))   # anchored gap after base close
-ML2_GAP_S = float(os.getenv("ML2_GAP_S", "0.25"))  # anchored gap after ML1 close
+SKEW_MS   = int(os.getenv("SKEW_MS", "2380"))      # base fires ~2.3s early vs entry
+ML1_GAP_S = float(os.getenv("ML1_GAP_S", "1.0"))   # optional tiny gap after base loss
+ML2_GAP_S = float(os.getenv("ML2_GAP_S", "0.25"))  # optional tiny gap after ML1 loss
+
+# hybrid poll tuning
+POLL_WINDOW_S  = float(os.getenv("POLL_WINDOW_S", "12"))   # how long to poll after expiry
+POLL_INTERVAL_S = float(os.getenv("POLL_INTERVAL_S", "0.2"))
 
 if not api_id or not api_hash:
     print("[FATAL] API_ID/API_HASH missing in .env"); sys.exit(1)
@@ -94,29 +99,19 @@ def resolve_entry_datetime(hhmm: str, msg_date_utc: datetime) -> datetime:
     candidate = et.replace(hour=hh, minute=mm, second=0, microsecond=0)
     return candidate - timedelta(minutes=tz_offset_minutes)
 
-def et_day_key() -> str:
-    now_utc = datetime.utcnow()
-    now_et = now_utc + timedelta(minutes=tz_offset_minutes)
-    return now_et.strftime("%Y-%m-%d")
-
 # ── Trade State ──────────────────────────────────────────────────────────────
 current = {
     "active": False, "pair": None, "direction": None, "expiry_min": 5,
     "amount": base_amount,
     "chain_id": None,
-    "expected_close": None
 }
 last_signal_utc: Optional[datetime] = None
 seen_ids = set()
 
 executor_busy = False
-daily_pnl = 0.0
-halted_for_day = False
-
 scheduled_tasks = []
 ml1_task = None
 ml2_task = None
-ttl_task = None
 
 def cancel_task(t):
     try:
@@ -126,11 +121,10 @@ def cancel_task(t):
         pass
 
 def cancel_all_tasks():
-    global scheduled_tasks, ml1_task, ml2_task, ttl_task
+    global scheduled_tasks, ml1_task, ml2_task
     for t in scheduled_tasks: cancel_task(t)
     cancel_task(ml1_task); ml1_task = None
     cancel_task(ml2_task); ml2_task = None
-    cancel_task(ttl_task); ttl_task = None
     scheduled_tasks = []
 
 def reset_chain(reason=""):
@@ -138,7 +132,7 @@ def reset_chain(reason=""):
     current.update({
         "active": False, "pair": None, "direction": None,
         "expiry_min": 5, "amount": base_amount,
-        "chain_id": None, "expected_close": None
+        "chain_id": None,
     })
     print(f"[RESET] {reason}" if reason else "[RESET] Chain cleared.")
 
@@ -158,11 +152,10 @@ def quick_peek(chain_id: str):
                 float(j.get("profit", 0.0)),
                 j.get("ml_tag", ""),
                 j.get("chain_id", ""),
-                j.get("closed_at", None)
             )
     except Exception:
         pass
-    return False, 0.0, "", "", None
+    return False, 0.0, "", ""
 
 def executor_trade(pair, amount, direction, ml_tag, chain_id) -> Dict:
     payload = {
@@ -173,8 +166,6 @@ def executor_trade(pair, amount, direction, ml_tag, chain_id) -> Dict:
         r = requests.post(f"{PO_URL}/trade", json=payload, timeout=400)
         if r.status_code == 200:
             return r.json()
-        else:
-            print(f"[API ERROR] {r.status_code}: {r.text}")
     except Exception as e:
         print(f"[API EXCEPTION] {e}")
     return {"success": False, "result": "OPEN", "profit": 0}
@@ -196,55 +187,51 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
         log_trade(clean_pair, direction, expiry_min, amount, "OPEN", 0.0, ml_tag, chain_id)
         print(f"[API] Fired: {direction} {clean_pair} ${amount} [{ml_tag}] [chain={chain_id}]")
 
-        exec_time = datetime.utcnow()
-        current["expected_close"] = exec_time + timedelta(minutes=expiry_min)
-
-        # Anchor ML levels
-        if ml_label is None:  # base
-            base_close = exec_time + timedelta(minutes=expiry_min)
-            ml1_fire = base_close + timedelta(seconds=ML1_GAP_S)
+        # Anchor next decision via hybrid wait (sleep then short poll)
+        if ml_label is None:
             cancel_task(ml1_task)
-            ml1_task = asyncio.create_task(schedule_leg(ml1_fire, 1, base_close, chain_id))
-            print(f"[CHAIN] ML1 anchored {ml1_fire}")
+            ml1_task = asyncio.create_task(wait_outcome_then_decide(expiry_min, 1, chain_id))
         elif ml_label == 1:
-            ml1_close = exec_time + timedelta(minutes=expiry_min)
-            ml2_fire = ml1_close + timedelta(seconds=ML2_GAP_S)
             cancel_task(ml2_task)
-            ml2_task = asyncio.create_task(schedule_leg(ml2_fire, 2, ml1_close, chain_id))
-            print(f"[CHAIN] ML2 anchored {ml2_fire}")
+            ml2_task = asyncio.create_task(wait_outcome_then_decide(expiry_min, 2, chain_id))
     finally:
         executor_busy = False
 
-# ── Scheduler ────────────────────────────────────────────────────────────────
-async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: Optional[datetime] = None, cid: Optional[str] = None):
-    label = "BASE" if ml_label is None else f"ML{ml_label}"
-    delay = max(0.0, (fire_dt - datetime.utcnow()).total_seconds())
-    print(f"[SCHEDULE] {label} fire={fire_dt} delay={delay:.3f}s [chain={cid}]")
+# ── Outcome-anchored hybrid wait ─────────────────────────────────────────────
+async def wait_outcome_then_decide(expiry_min: int, ml_label: int, cid: str):
+    """
+    Sleep for full expiry, then tight-poll /peek for up to POLL_WINDOW_S.
+    If WIN (profit>0) for same chain -> reset (cancel downstream).
+    If LOSS -> fire next ML immediately (optionally add tiny ML gap).
+    If no posted result within window -> failsafe: stop chain to avoid misfire.
+    """
+    label = f"ML{ml_label}"
+    full_sleep = max(0.0, expiry_min * 60.0)
+    print(f"[WAIT] {label}: sleeping {full_sleep:.2f}s for expiry [chain={cid}]")
+    await asyncio.sleep(full_sleep)
 
-    try:
-        await asyncio.sleep(delay)
+    # short, tight poll window
+    start = datetime.utcnow()
+    while (datetime.utcnow() - start).total_seconds() < POLL_WINDOW_S:
+        ok, profit, _tag, peek_chain = quick_peek(cid)
+        if ok and peek_chain == cid:
+            if profit > 0:
+                reset_chain(f"{label} cancelled: WIN via /peek [chain={cid}]")
+                return
+            # LOSS -> fire next leg immediately (optionally tiny cosmetic delay)
+            gap = ML1_GAP_S if ml_label == 1 else ML2_GAP_S
+            if gap > 0:
+                await asyncio.sleep(gap)
+            amt = min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
+            await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=ml_label)
+            return
+        await asyncio.sleep(POLL_INTERVAL_S)
 
-        if ml_label in (1, 2):
-            start = datetime.utcnow()
-            while (datetime.utcnow() - start).total_seconds() < 5.0:  # 5s window
-                ok, p, tag, peek_chain, closed_at = quick_peek(cid)
-                if ok and p > 0 and peek_chain == cid:
-                    if current["expected_close"] and closed_at:
-                        closed_dt = datetime.fromisoformat(closed_at)
-                        if abs((closed_dt - current["expected_close"]).total_seconds()) <= 7:
-                            reset_chain(f"{tag} cancelled: WIN via /peek [chain={cid}]")
-                            return
-                await asyncio.sleep(0.2)
-
-        amt = base_amount if ml_label is None else min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
-        await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=ml_label)
-    except asyncio.CancelledError:
-        print(f"[CANCEL] {label} cancelled.")
-        return
+    # Failsafe: no outcome posted within window → stop chain (safer than misfire)
+    reset_chain(f"{label} aborted: no posted result within {POLL_WINDOW_S}s [chain={cid}]")
 
 # ── Signal Handling ──────────────────────────────────────────────────────────
 async def handle_signal_from_text(text: str, msg_date=None):
-    global last_signal_utc
     sig = parse_signal(text)
     if not sig: return False
     if not msg_date: msg_date = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -256,13 +243,18 @@ async def handle_signal_from_text(text: str, msg_date=None):
     current.update({
         "active": True, "pair": force_otc(sig["pair"]), "direction": sig["direction"],
         "expiry_min": sig["expiry_min"], "amount": base_amount,
-        "chain_id": cid, "expected_close": None
+        "chain_id": cid,
     })
-    last_signal_utc = datetime.utcnow()
     print(f"[SIGNAL] {current['pair']} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} [chain={cid}]")
 
+    # schedule base slightly early to match provider's entry timing
     base_fire = base_dt - timedelta(milliseconds=SKEW_MS)
-    t0 = asyncio.create_task(schedule_leg(base_fire, None, cid=cid)); scheduled_tasks.append(t0)
+    delay = max(0.0, (base_fire - datetime.utcnow()).total_seconds())
+    t0 = asyncio.create_task(asyncio.sleep(delay))
+    async def _fire_base():
+        await t0
+        await run_one_trade(current["pair"], current["direction"], current["expiry_min"], base_amount, ml_label=None)
+    scheduled_tasks.append(asyncio.create_task(_fire_base()))
     return True
 
 async def on_signal(e):
@@ -283,7 +275,6 @@ async def main():
         except SessionPasswordNeededError:
             pw = input("Enter 2FA password: ").strip()
             await client.sign_in(password=pw)
-    me = await client.get_me()
     entity = await client.get_entity(channel)
     client.add_event_handler(on_signal, events.NewMessage(chats=entity))
     print("[DEBUG] Pocket Option trade screen ready.")
