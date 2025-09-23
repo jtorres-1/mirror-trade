@@ -1,4 +1,4 @@
-// po_executor.js — Executor with robust closed-trade parsing (DOM-based, active polling)
+// po_executor.js — Executor with robust closed-trade parsing (DOM-based, stateless)
 
 const path = require("path");
 const express = require("express");
@@ -255,22 +255,6 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", e
 
   const ts = new Date().toISOString();
   appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id, "");
-
-  // --- Active polling near expiry ---
-  (async () => {
-    const expiryMs = expiration * 1000;
-    await sleep(expiryMs - 10000); // wait until ~10s before expiry
-    const startPoll = Date.now();
-    let found = false;
-    while (!found && (Date.now() - startPoll) < 15000) {
-      const meta = await parseClosedTrade(amount, pair, direction, ml_tag, chain_id);
-      if (meta && meta.result) {
-        found = true;
-        break;
-      }
-      await sleep(300);
-    }
-  })();
 
   return { success: true, result: "OPEN", profit: 0, ml_tag, chain_id };
 }
