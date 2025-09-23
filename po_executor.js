@@ -1,4 +1,4 @@
-// po_executor.js — Executor with robust closed-trade parsing (DOM + active polling)
+// po_executor.js — Executor with robust closed-trade parsing (DOM-based, no lastTradeMeta fallback)
 
 const path = require("path");
 const express = require("express");
@@ -25,14 +25,13 @@ const SEL = {
 
   closedTab: 'li:has-text("Closed")',
   closedRow: '.deals-list__item',
-  directionUp: 'i.fa.fa-arrow-up',
-  directionDown: 'i.fa.fa-arrow-down',
+  directionUp: 'i.fa.fa-arrow-up',   // Buy/Call
+  directionDown: 'i.fa.fa-arrow-down', // Sell/Put
   profitCell: '.centered'
 };
 
 let context, page;
 let tradeInProgress = false;
-let lastTradeMeta = null;
 let recentTrades = {};
 let lastPairCache = null;
 let lastDirectionCache = null;
@@ -229,27 +228,12 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", e
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""}`);
   tradeInProgress = false;
 
-  lastTradeMeta = { amount: Number(amount), ts: Date.now(), pair, direction, ml_tag, chain_id, closed_at: null };
-
-  lastPairCache = pair;
-  lastDirectionCache = direction;
-
   const ts = new Date().toISOString();
   appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id, "");
 
-  // Active polling instead of one long sleep
   (async () => {
-    const expiryMs = expiration * 1000;
-    const idle = expiryMs - 10000; // wait until ~10s before expiry
-    if (idle > 0) await sleep(idle);
-
-    let found = false;
-    const startPoll = Date.now();
-    while (!found && (Date.now() - startPoll) < 15000) { // poll up to 15s
-      const got = await parseClosedTrade(amount, pair, direction, ml_tag, chain_id, true);
-      if (got) found = true;
-      else await sleep(300);
-    }
+    await sleep(expiration * 1000 - 1000); // ~299s
+    await parseClosedTrade(amount, pair, direction, ml_tag, chain_id);
   })();
 
   return { success: true, result: "OPEN", profit: 0, ml_tag, chain_id };
@@ -263,14 +247,13 @@ function recordClosedTrade(meta) {
   recentTrades[chain_id].unshift(meta);
   recentTrades[chain_id] = recentTrades[chain_id].filter(t => Date.now() - new Date(t.closed_at).getTime() < 600000); // 10min TTL
   if (recentTrades[chain_id].length > 5) recentTrades[chain_id].pop();
-  lastTradeMeta = meta;
 }
 
-async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "", pollMode = false) {
+async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") {
   let profit = 0.0, result = "LOSS", closed_at = new Date().toISOString();
   try {
     await page.locator(SEL.closedTab).click({ timeout: 2000 });
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(1000);
 
     let rows = await page.locator(SEL.closedRow).all();
     for (let row of rows) {
@@ -301,19 +284,18 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "", 
         }
       } catch {}
 
-      const meta = { amount, pair, direction, ml_tag, chain_id, profit, result, closed_at };
-      recordClosedTrade(meta);
-
-      const ts2 = new Date().toISOString();
-      appendLog(ts2, pair, direction, amount, result, profit, ml_tag, chain_id, closed_at);
-      console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""} closed_at=${closed_at}`);
-
-      return true; // found
+      break;
     }
   } catch (err) {
-    if (!pollMode) console.error("[❌] Result parse failed:", err.message);
+    console.error("[❌] Result parse failed:", err.message);
   }
-  return false;
+
+  const meta = { amount, pair, direction, ml_tag, chain_id, profit, result, closed_at };
+  recordClosedTrade(meta);
+
+  const ts2 = new Date().toISOString();
+  appendLog(ts2, pair, direction, amount, result, profit, ml_tag, chain_id, closed_at);
+  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""} closed_at=${closed_at}`);
 }
 
 // ----------------------------- Peek Endpoint --------------------------------
@@ -324,7 +306,7 @@ async function peekLatestProfit(chain_id = null) {
   if (chain_id && recentTrades[chain_id]?.length) {
     return recentTrades[chain_id][0];
   }
-  return lastTradeMeta;
+  return null; // no fallback
 }
 
 const app = express();
