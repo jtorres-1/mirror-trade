@@ -252,7 +252,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
         # Force cancels on all wins
         if profit > 0:
             last_win_chain = chain_id
-            if ml_label == 0:
+            if ml_label is None:  # Fixed from ml_label == 0 to ml_label is None for Base
                 cancel_task(ml1_task); ml1_task = None
                 cancel_task(ml2_task); ml2_task = None
                 reset_chain(f"Base WIN — cancelled ML1 and ML2. [chain={last_win_chain}]")
@@ -306,10 +306,10 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
         await asyncio.sleep(delay)
 
         if ml_label in (1, 2):
-            # Asynchronous WIN check (non-blocking, reduced to 3s)
+            # Asynchronous WIN check (non-blocking, extended to 5s)
             async def check_win():
                 start = datetime.utcnow()
-                while (datetime.utcnow() - start).total_seconds() < 3.0:  # Reduced from 5.0
+                while (datetime.utcnow() - start).total_seconds() < 5.0:  # Extended from 3.0 to 5.0
                     ok, p, tag, peek_chain, closed_at = quick_peek(cid)
                     if ok and p > 0 and peek_chain == cid:
                         if current["expected_close"]:
@@ -317,7 +317,7 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
                                 closed_dt = datetime.fromisoformat(closed_at) if closed_at else None
                                 if closed_dt and abs((closed_dt - current["expected_close"]).total_seconds()) <= 7:
                                     last_win_chain = cid
-                                    reset_chain(f"{label} cancelled: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
+                                    reset_chain(f"{tag} cancelled: WIN via /peek (profit {p}) [chain={cid}]")
                                     return True
                             except:
                                 pass
