@@ -1,4 +1,4 @@
-// po_executor.js — Executor with robust closed-trade parsing (DOM-based)
+// po_executor.js — Executor with robust closed-trade parsing (DOM + active polling)
 
 const path = require("path");
 const express = require("express");
@@ -24,10 +24,10 @@ const SEL = {
   sellBtn: '#put-call-buttons-chart-1 a.sell, #put-call-buttons-chart-1 button:has-text("Sell"), a.btn.btn-put',
 
   closedTab: 'li:has-text("Closed")',
-  closedRow: '.deals-list__item',               // each closed trade row
-  directionUp: 'i.fa.fa-arrow-up',              // Buy/Call
-  directionDown: 'i.fa.fa-arrow-down',          // Sell/Put
-  profitCell: '.centered'                       // Profit value cell
+  closedRow: '.deals-list__item',
+  directionUp: 'i.fa.fa-arrow-up',
+  directionDown: 'i.fa.fa-arrow-down',
+  profitCell: '.centered'
 };
 
 let context, page;
@@ -237,9 +237,19 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", e
   const ts = new Date().toISOString();
   appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id, "");
 
+  // Active polling instead of one long sleep
   (async () => {
-    await sleep(expiration * 1000 - 1000); // 299s
-    await parseClosedTrade(amount, pair, direction, ml_tag, chain_id);
+    const expiryMs = expiration * 1000;
+    const idle = expiryMs - 10000; // wait until ~10s before expiry
+    if (idle > 0) await sleep(idle);
+
+    let found = false;
+    const startPoll = Date.now();
+    while (!found && (Date.now() - startPoll) < 15000) { // poll up to 15s
+      const got = await parseClosedTrade(amount, pair, direction, ml_tag, chain_id, true);
+      if (got) found = true;
+      else await sleep(300);
+    }
   })();
 
   return { success: true, result: "OPEN", profit: 0, ml_tag, chain_id };
@@ -256,11 +266,11 @@ function recordClosedTrade(meta) {
   lastTradeMeta = meta;
 }
 
-async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") {
+async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "", pollMode = false) {
   let profit = 0.0, result = "LOSS", closed_at = new Date().toISOString();
   try {
     await page.locator(SEL.closedTab).click({ timeout: 2000 });
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(500);
 
     let rows = await page.locator(SEL.closedRow).all();
     for (let row of rows) {
@@ -291,18 +301,19 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
         }
       } catch {}
 
-      break;
+      const meta = { amount, pair, direction, ml_tag, chain_id, profit, result, closed_at };
+      recordClosedTrade(meta);
+
+      const ts2 = new Date().toISOString();
+      appendLog(ts2, pair, direction, amount, result, profit, ml_tag, chain_id, closed_at);
+      console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""} closed_at=${closed_at}`);
+
+      return true; // found
     }
   } catch (err) {
-    console.error("[❌] Result parse failed:", err.message);
+    if (!pollMode) console.error("[❌] Result parse failed:", err.message);
   }
-
-  const meta = { amount, pair, direction, ml_tag, chain_id, profit, result, closed_at };
-  recordClosedTrade(meta);
-
-  const ts2 = new Date().toISOString();
-  appendLog(ts2, pair, direction, amount, result, profit, ml_tag, chain_id, closed_at);
-  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""} closed_at=${closed_at}`);
+  return false;
 }
 
 // ----------------------------- Peek Endpoint --------------------------------
