@@ -1,4 +1,5 @@
-// po_executor.js  Executor with live Closed tab scraping for /peek
+// po_executor.js — Executor with robust Closed tab scraping for /peek
+// Hardened against stale results, formatting mismatches, and cross-chain contamination.
 
 const path = require("path");
 const express = require("express");
@@ -27,7 +28,8 @@ const SEL = {
   closedRow: '.deals-list__item',
   directionUp: 'i.fa.fa-arrow-up',
   directionDown: 'i.fa.fa-arrow-down',
-  profitCell: '.centered'
+  profitCell: '.centered',
+  closeTime: '.close-time'
 };
 
 let context, page;
@@ -36,7 +38,6 @@ let recentTrades = {};
 let lastPairCache = null;
 
 // remembers the most recent placed trade params per chain
-// used by /peek to scrape the correct row
 const expectedByChain = Object.create(null);
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -172,7 +173,9 @@ function recordClosedTrade(meta) {
   if (!chain_id) return;
   if (!recentTrades[chain_id]) recentTrades[chain_id] = [];
   recentTrades[chain_id].unshift(meta);
-  recentTrades[chain_id] = recentTrades[chain_id].filter(t => Date.now() - new Date(t.closed_at).getTime() < 600000);
+  recentTrades[chain_id] = recentTrades[chain_id].filter(
+    t => Date.now() - new Date(t.closed_at).getTime() < 600000
+  );
   if (recentTrades[chain_id].length > 5) recentTrades[chain_id].pop();
 }
 
@@ -180,34 +183,48 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
   let profit = 0.0, result = "LOSS", closed_at = new Date().toISOString();
   try {
     await page.locator(SEL.closedTab).click({ timeout: 2000 });
+    await page.waitForSelector(SEL.closedRow, { timeout: 3000 });
     await page.waitForTimeout(500);
 
     const rows = await page.locator(SEL.closedRow).all();
     for (const row of rows) {
       const text = await row.innerText();
 
+      // --- Pair check
       if (pair && !text.includes(pair)) continue;
-      if (amount && !text.includes(String(amount))) continue;
 
+      // --- Amount check (numeric tolerant)
+      const numericMatches = text.match(/[\d.,]+/g) || [];
+      const hasAmount = numericMatches.some(num => {
+        const val = parseFloat(num.replace(/,/g, ""));
+        return !isNaN(val) && Math.abs(val - amount) < 0.01;
+      });
+      if (amount && !hasAmount) continue;
+
+      // --- Direction check
       let detectedDirection = null;
       if (await row.locator(SEL.directionUp).count() > 0) detectedDirection = "BUY";
       if (await row.locator(SEL.directionDown).count() > 0) detectedDirection = "SELL";
       if (detectedDirection && direction && detectedDirection !== direction.toUpperCase()) continue;
 
+      // --- Profit check
       const profitNode = row.locator(SEL.profitCell).last();
       let profitText = await profitNode.innerText();
       profitText = profitText.replace(/[^\d.-]/g, "");
       profit = parseFloat(profitText || "0");
       result = profit > 0 ? "WIN" : "LOSS";
 
+      // --- Closed time freshness
       try {
-        const timeNode = row.locator(".close-time").first();
+        const timeNode = row.locator(SEL.closeTime).first();
         if (await timeNode.count()) {
           const timeStr = await timeNode.innerText();
           const now = new Date();
           closed_at = new Date(now.toDateString() + " " + timeStr + " UTC").toISOString();
         }
       } catch {}
+      const closedAgo = Date.now() - new Date(closed_at).getTime();
+      if (closedAgo > 180000) continue; // skip if older than 3 min
 
       break;
     }
@@ -253,9 +270,8 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", e
       console.error("[❌] Button click failed:", err.message);
     });
 
-    // remember the most recent placed trade for this chain
     if (chain_id) {
-      expectedByChain[chain_id] = { amount, pair, direction, ml_tag };
+      expectedByChain[chain_id] = { amount, pair, direction, ml_tag, ts: Date.now() };
     }
 
     const ts = new Date().toISOString();
@@ -273,12 +289,8 @@ async function peekLatestProfit(chain_id = null) {
 
   if (!chain_id) return null;
   const expected = expectedByChain[chain_id];
-  if (!expected) {
-    // we do not know what to look for yet
-    return null;
-  }
+  if (!expected) return null;
 
-  // scrape live Closed tab for the exact trade referenced by this chain
   const { amount, pair, direction, ml_tag } = expected;
   const meta = await parseClosedTrade(amount, pair, direction, ml_tag, chain_id);
   return meta || null;
