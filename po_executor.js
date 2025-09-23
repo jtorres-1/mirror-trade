@@ -1,4 +1,4 @@
-// po_executor.js — Executor with robust closed-trade parsing (DOM-based, no lastTradeMeta fallback)
+// po_executor.js — Executor with robust closed-trade parsing (DOM-based, active polling)
 
 const path = require("path");
 const express = require("express");
@@ -34,7 +34,6 @@ let context, page;
 let tradeInProgress = false;
 let recentTrades = {};
 let lastPairCache = null;
-let lastDirectionCache = null;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -116,7 +115,7 @@ async function setTradeAmount(amount) {
   await page.keyboard.type(String(amount)).catch(() => {});
 }
 
-// ----------------------------- Patched selectPair ---------------------------
+// ----------------------------- Pair Selection -------------------------------
 async function selectPair(pair) {
   if (lastPairCache && lastPairCache.toLowerCase() === pair.toLowerCase()) {
     console.log(`[Cache] Skipping selectPair, reusing: ${pair}`);
@@ -166,86 +165,13 @@ function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "", chain_id 
   fs.appendFileSync(LOG_FILE, `${ts},${pair},${dir},${amount},${result},${profit},${ml_tag},${chain_id},${closed_at}\n`);
 }
 
-// ----------------------------- Trade Placement ------------------------------
-async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", expiration = 300) {
-  if (tradeInProgress) {
-    console.warn("[Guard] Trade already in progress. Skipping duplicate request.");
-    return { success: false, result: "SKIPPED", profit: 0, ml_tag, chain_id };
-  }
-  tradeInProgress = true;
-
-  console.log(`[Step] Trade request: ${direction.toUpperCase()} ${pair} $${amount} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""}`);
-  await ensurePageAlive();
-  await ensureOnPO();
-
-  await forceCloseOverlays();
-
-  try {
-    await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
-  } catch (err) {
-    const ts = Date.now();
-    const screenshotPath = path.join(SCREEN_DIR, `failed_selectPair_${pair}_${ts}.png`);
-    try {
-      await page.screenshot({ path: screenshotPath, fullPage: true });
-      console.log(`[📸] Saved selectPair screenshot: ${screenshotPath}`);
-    } catch (ssErr) {
-      console.error("[❌] Failed to capture selectPair screenshot:", ssErr.message);
-    }
-    tradeInProgress = false;
-    throw err;
-  }
-
-  console.log("[Step] Setting amount…");
-  await withRetry(async () => { await setTradeAmount(amount); }, 2, "setTradeAmount");
-
-  await forceCloseOverlays();
-
-  const panel = page.locator(SEL.tradePanel).first();
-  const btn = direction.toLowerCase() === 'buy'
-    ? panel.locator(SEL.buyBtn).first()
-    : panel.locator(SEL.sellBtn).first();
-
-  await btn.scrollIntoViewIfNeeded().catch(() => {});
-  await btn.waitFor({ state: 'visible', timeout: DEFAULT_TIMEOUT });
-  console.log(`[CLICK] ${direction.toUpperCase()} button for ${pair} @ $${amount}`);
-
-  try {
-    await btn.click({ timeout: DEFAULT_TIMEOUT, force: true });
-  } catch (err) {
-    console.error("[❌] Button click failed:", err.message);
-    const ts = Date.now();
-    const screenshotPath = path.join(SCREEN_DIR, `failed_click_${pair}_${direction}_${ts}.png`);
-    try {
-      await page.screenshot({ path: screenshotPath, fullPage: true });
-      console.log(`[📸] Saved screenshot: ${screenshotPath}`);
-    } catch (ssErr) {
-      console.error("[❌] Failed to capture screenshot:", ssErr.message);
-    }
-    tradeInProgress = false;
-    throw err;
-  }
-
-  console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""}`);
-  tradeInProgress = false;
-
-  const ts = new Date().toISOString();
-  appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id, "");
-
-  (async () => {
-    await sleep(expiration * 1000 - 1000); // ~299s
-    await parseClosedTrade(amount, pair, direction, ml_tag, chain_id);
-  })();
-
-  return { success: true, result: "OPEN", profit: 0, ml_tag, chain_id };
-}
-
 // ----------------------------- Result Parser --------------------------------
 function recordClosedTrade(meta) {
   const { chain_id } = meta;
   if (!chain_id) return;
   if (!recentTrades[chain_id]) recentTrades[chain_id] = [];
   recentTrades[chain_id].unshift(meta);
-  recentTrades[chain_id] = recentTrades[chain_id].filter(t => Date.now() - new Date(t.closed_at).getTime() < 600000); // 10min TTL
+  recentTrades[chain_id] = recentTrades[chain_id].filter(t => Date.now() - new Date(t.closed_at).getTime() < 600000);
   if (recentTrades[chain_id].length > 5) recentTrades[chain_id].pop();
 }
 
@@ -253,7 +179,7 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
   let profit = 0.0, result = "LOSS", closed_at = new Date().toISOString();
   try {
     await page.locator(SEL.closedTab).click({ timeout: 2000 });
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(500);
 
     let rows = await page.locator(SEL.closedRow).all();
     for (let row of rows) {
@@ -261,20 +187,17 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
       if (!text.includes(pair)) continue;
       if (!text.includes(String(amount))) continue;
 
-      // --- Direction detection ---
       let detectedDirection = null;
       if (await row.locator(SEL.directionUp).count() > 0) detectedDirection = "BUY";
       if (await row.locator(SEL.directionDown).count() > 0) detectedDirection = "SELL";
       if (detectedDirection && detectedDirection !== direction.toUpperCase()) continue;
 
-      // --- Profit detection ---
       const profitNode = row.locator(SEL.profitCell).last();
       let profitText = await profitNode.innerText();
       profitText = profitText.replace(/[^\d.-]/g, "");
       profit = parseFloat(profitText || "0");
       result = profit > 0 ? "WIN" : "LOSS";
 
-      // --- Close time ---
       try {
         const timeNode = row.locator(".close-time").first();
         if (await timeNode.count()) {
@@ -295,7 +218,61 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
 
   const ts2 = new Date().toISOString();
   appendLog(ts2, pair, direction, amount, result, profit, ml_tag, chain_id, closed_at);
-  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""} closed_at=${closed_at}`);
+  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} [${ml_tag}] [chain=${chain_id}] closed_at=${closed_at}`);
+  return meta;
+}
+
+// ----------------------------- Trade Placement ------------------------------
+async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", expiration = 300) {
+  if (tradeInProgress) {
+    console.warn("[Guard] Trade already in progress. Skipping duplicate request.");
+    return { success: false, result: "SKIPPED", profit: 0, ml_tag, chain_id };
+  }
+  tradeInProgress = true;
+
+  console.log(`[Step] Trade request: ${direction.toUpperCase()} ${pair} $${amount} [${ml_tag}] [chain=${chain_id}]`);
+  await ensurePageAlive();
+  await ensureOnPO();
+  await forceCloseOverlays();
+
+  await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
+  await withRetry(async () => { await setTradeAmount(amount); }, 2, "setTradeAmount");
+
+  const panel = page.locator(SEL.tradePanel).first();
+  const btn = direction.toLowerCase() === 'buy'
+    ? panel.locator(SEL.buyBtn).first()
+    : panel.locator(SEL.sellBtn).first();
+
+  await btn.scrollIntoViewIfNeeded().catch(() => {});
+  await btn.waitFor({ state: 'visible', timeout: DEFAULT_TIMEOUT });
+  console.log(`[CLICK] ${direction.toUpperCase()} button for ${pair} @ $${amount}`);
+
+  await btn.click({ timeout: DEFAULT_TIMEOUT, force: true }).catch(err => {
+    console.error("[❌] Button click failed:", err.message);
+  });
+
+  tradeInProgress = false;
+
+  const ts = new Date().toISOString();
+  appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id, "");
+
+  // --- Active polling near expiry ---
+  (async () => {
+    const expiryMs = expiration * 1000;
+    await sleep(expiryMs - 10000); // wait until ~10s before expiry
+    const startPoll = Date.now();
+    let found = false;
+    while (!found && (Date.now() - startPoll) < 15000) {
+      const meta = await parseClosedTrade(amount, pair, direction, ml_tag, chain_id);
+      if (meta && meta.result) {
+        found = true;
+        break;
+      }
+      await sleep(300);
+    }
+  })();
+
+  return { success: true, result: "OPEN", profit: 0, ml_tag, chain_id };
 }
 
 // ----------------------------- Peek Endpoint --------------------------------
@@ -306,9 +283,10 @@ async function peekLatestProfit(chain_id = null) {
   if (chain_id && recentTrades[chain_id]?.length) {
     return recentTrades[chain_id][0];
   }
-  return null; // no fallback
+  return null;
 }
 
+// ----------------------------- Express API ---------------------------------
 const app = express();
 app.use(express.json());
 
@@ -322,11 +300,8 @@ app.post("/trade", (req, res) => {
   res.json({ success: true, result: "QUEUED", pair, amount, direction, ml_tag, chain_id });
 
   (async () => {
-    try {
-      await placeTrade(pair, amount, direction, ml_tag, chain_id, expiration);
-    } catch (err) {
-      console.error("[❌] Background trade failed:", err);
-    }
+    try { await placeTrade(pair, amount, direction, ml_tag, chain_id, expiration); }
+    catch (err) { console.error("[❌] Background trade failed:", err); }
   })();
 });
 
@@ -335,22 +310,9 @@ app.get("/peek", async (req, res) => {
     const { chain_id } = req.query;
     const result = await peekLatestProfit(chain_id);
     if (!result) return res.json({ ok: false, profit: 0, ml_tag: "", chain_id: "", closed_at: null });
-    return res.json({
-      ok: true,
-      profit: result.profit,
-      ml_tag: result.ml_tag || "",
-      chain_id: result.chain_id || "",
-      closed_at: result.closed_at || null
-    });
+    return res.json({ ok: true, profit: result.profit, ml_tag: result.ml_tag, chain_id: result.chain_id, closed_at: result.closed_at });
   } catch (err) {
-    return res.json({
-      ok: false,
-      error: err?.message || String(err),
-      profit: 0,
-      ml_tag: "",
-      chain_id: "",
-      closed_at: null
-    });
+    return res.json({ ok: false, error: err?.message || String(err), profit: 0, ml_tag: "", chain_id: "", closed_at: null });
   }
 });
 
