@@ -279,7 +279,7 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
             const now = new Date();
             closed_at = new Date(now.toDateString() + " " + timeStr + " UTC").toISOString();
           }
-          return; // Exit on match
+          break; // Changed from return to break
         }
       }
       attempt++;
