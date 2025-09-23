@@ -29,7 +29,7 @@ ML1_GAP_S = float(os.getenv("ML1_GAP_S", "1.0"))   # optional tiny gap after bas
 ML2_GAP_S = float(os.getenv("ML2_GAP_S", "0.25"))  # optional tiny gap after ML1 loss
 
 # hybrid poll tuning
-POLL_WINDOW_S  = float(os.getenv("POLL_WINDOW_S", "12"))   # how long to poll after expiry
+POLL_WINDOW_S  = float(os.getenv("POLL_WINDOW_S", "30"))   # increased from 12s → 30s
 POLL_INTERVAL_S = float(os.getenv("POLL_INTERVAL_S", "0.2"))
 
 if not api_id or not api_hash:
@@ -199,12 +199,6 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
 
 # ── Outcome-anchored hybrid wait ─────────────────────────────────────────────
 async def wait_outcome_then_decide(expiry_min: int, ml_label: int, cid: str):
-    """
-    Sleep for full expiry, then tight-poll /peek for up to POLL_WINDOW_S.
-    If WIN (profit>0) for same chain -> reset (cancel downstream).
-    If LOSS -> fire next ML immediately (optionally add tiny ML gap).
-    If no posted result within window -> failsafe: stop chain to avoid misfire.
-    """
     label = f"ML{ml_label}"
     full_sleep = max(0.0, expiry_min * 60.0)
     print(f"[WAIT] {label}: sleeping {full_sleep:.2f}s for expiry [chain={cid}]")
@@ -218,7 +212,6 @@ async def wait_outcome_then_decide(expiry_min: int, ml_label: int, cid: str):
             if profit > 0:
                 reset_chain(f"{label} cancelled: WIN via /peek [chain={cid}]")
                 return
-            # LOSS -> fire next leg immediately (optionally tiny cosmetic delay)
             gap = ML1_GAP_S if ml_label == 1 else ML2_GAP_S
             if gap > 0:
                 await asyncio.sleep(gap)
@@ -227,7 +220,6 @@ async def wait_outcome_then_decide(expiry_min: int, ml_label: int, cid: str):
             return
         await asyncio.sleep(POLL_INTERVAL_S)
 
-    # Failsafe: no outcome posted within window → stop chain (safer than misfire)
     reset_chain(f"{label} aborted: no posted result within {POLL_WINDOW_S}s [chain={cid}]")
 
 # ── Signal Handling ──────────────────────────────────────────────────────────
@@ -247,7 +239,6 @@ async def handle_signal_from_text(text: str, msg_date=None):
     })
     print(f"[SIGNAL] {current['pair']} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} [chain={cid}]")
 
-    # schedule base slightly early to match provider's entry timing
     base_fire = base_dt - timedelta(milliseconds=SKEW_MS)
     delay = max(0.0, (base_fire - datetime.utcnow()).total_seconds())
     t0 = asyncio.create_task(asyncio.sleep(delay))
