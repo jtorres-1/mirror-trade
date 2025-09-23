@@ -22,7 +22,7 @@ const SEL = {
   sellBtn: '#put-call-buttons-chart-1 a.sell, #put-call-buttons-chart-1 button:has-text("Sell"), a.btn.btn-put',
 
   closedTab: 'li:has-text("Closed")',
-  closedRow: '.deals-list__item'
+  closedRow: '.widget-slot .item-row' // Updated to match DOM structure
 };
 
 let context, page;
@@ -254,28 +254,27 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
   let profit = 0.0, result = "LOSS", closed_at = new Date().toISOString();
   try {
     await page.locator(SEL.closedTab).click({ timeout: 1000 });
-    const rows = page.locator(SEL.closedRow);
-    await rows.first().waitFor({ state: "visible", timeout: 5000 });
-    let row = rows.first();
-    for (let i = 0; i < 3; i++) {
-      const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
+    const rows = await page.locator(SEL.closedRow).all();
+    await page.waitForTimeout(500); // Brief wait for rows to stabilize
+    for (let row of rows) {
+      const rowText = await row.innerText();
       console.log(`[Debug] Checking row text: ${rowText}`);
-      if (rowText.includes(String(amount)) && rowText.match(/\d{2}:\d{2}/)) {
+      if (rowText.includes(String(amount)) && rowText.match(/\d{2}:\d{2}:\d{2}/)) {
+        const amountNode = await row.locator('.amount').first();
+        const closeTimeNode = await row.locator('.close-time').first();
         const profitMatches = rowText.match(/\$-?[0-9.]+/g);
         if (profitMatches?.length) {
           profit = parseFloat(profitMatches[profitMatches.length - 1].replace("$", ""));
           result = profit > 0 ? "WIN" : "LOSS";
         }
-        const timeMatch = rowText.match(/\d{2}:\d{2}/);
-        if (timeMatch) {
+        if (closeTimeNode) {
+          const timeStr = await closeTimeNode.innerText();
           const now = new Date();
-          closed_at = new Date(now.toDateString() + " " + timeMatch[0] + " UTC").toISOString();
+          closed_at = new Date(now.toDateString() + " " + timeStr + " UTC").toISOString();
         }
         break;
       }
-      row = row.nextSibling();
-      if (!row) break;
-      await sleep(1000);
+      await page.waitForTimeout(500); // Prevent tight looping
     }
   } catch (err) {
     console.error("[❌] Result parse failed:", err.message);
