@@ -1,3 +1,5 @@
+// po_executor.js — Executor with instant OPEN + reliable Closed parse + /peek
+
 const path = require("path");
 const express = require("express");
 const { chromium } = require("playwright");
@@ -22,15 +24,15 @@ const SEL = {
   sellBtn: '#put-call-buttons-chart-1 a.sell, #put-call-buttons-chart-1 button:has-text("Sell"), a.btn.btn-put',
 
   closedTab: 'li:has-text("Closed")',
-  closedRow: '.widget-slot .item-row' // Updated to match DOM structure
+  closedRow: '.widget-slot .item-row'
 };
 
 let context, page;
 let tradeInProgress = false;
 let lastTradeMeta = null; // { amount, ts, pair, direction, ml_tag, chain_id, closed_at }
-let recentTrades = {};    // NEW: buffer of trades by chain_id
+let recentTrades = {};    // buffer by chain_id
 let lastPairCache = null;
-let lastDirectionCache = null;
+
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ----------------------------- Utilities ------------------------------------
@@ -54,20 +56,10 @@ async function waitForTradePanel() {
 
 async function forceCloseOverlays() {
   try {
-    const overlayVisible = await page.locator("div.mfp-wrap, .drop-down-modal-wrap.active").first().isVisible().catch(() => false);
-    if (!overlayVisible) return;
-
     await page.evaluate(() => {
       document.querySelectorAll("div.mfp-bg, div.mfp-wrap, .drop-down-modal-wrap.active").forEach(el => el.remove());
     }).catch(() => {});
-
-    await sleep(400);
-    const stillVisible = await page.locator("div.mfp-wrap, .drop-down-modal-wrap.active").first().isVisible().catch(() => false);
-    if (stillVisible) {
-      console.log("[Heal] Overlay stuck — reloading page");
-      await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-      await ensureOnPO();
-    }
+    await sleep(300);
   } catch (err) {
     console.error("[Overlay] Force close failed:", err.message);
   }
@@ -111,7 +103,7 @@ async function setTradeAmount(amount) {
   await page.keyboard.type(String(amount)).catch(() => {});
 }
 
-// ----------------------------- Patched selectPair ---------------------------
+// ----------------------------- Pair Selection -------------------------------
 async function selectPair(pair) {
   if (lastPairCache && lastPairCache.toLowerCase() === pair.toLowerCase()) {
     console.log(`[Cache] Skipping selectPair, reusing: ${pair}`);
@@ -119,38 +111,26 @@ async function selectPair(pair) {
   }
 
   const toggle = page.locator(SEL.symbolToggle).first();
-  try {
-    await withRetry(async () => {
-      await toggle.click({ timeout: DEFAULT_TIMEOUT });
-      await page.waitForSelector(SEL.assetOverlay, { state: 'visible', timeout: DEFAULT_TIMEOUT });
-    }, 2, "open asset overlay");
+  await withRetry(async () => {
+    await toggle.click({ timeout: DEFAULT_TIMEOUT });
+    await page.waitForSelector(SEL.assetOverlay, { state: 'visible', timeout: DEFAULT_TIMEOUT });
+  }, 2, "open asset overlay");
 
-    const cleaned = pair.replace(" OTC", "").replace("/", "").toLowerCase();
-    const search = page.locator(SEL.searchInput).first();
-    await search.fill("");
-    await search.type(cleaned, { delay: 30 }).catch(() => {});
-    await sleep(200);
+  const cleaned = pair.replace(" OTC", "").replace("/", "").toLowerCase();
+  const search = page.locator(SEL.searchInput).first();
+  await search.fill("");
+  await search.type(cleaned, { delay: 30 }).catch(() => {});
+  await sleep(200);
 
-    const listItem = page.locator('.alist__label', { hasText: pair }).first();
-    await withRetry(async () => { await listItem.click({ timeout: DEFAULT_TIMEOUT }); }, 2, "select list item");
+  const listItem = page.locator('.alist__label', { hasText: pair }).first();
+  await withRetry(async () => { await listItem.click({ timeout: DEFAULT_TIMEOUT }); }, 2, "select list item");
 
-    console.log(`[Step] Selected pair: ${pair}`);
-    await page.keyboard.press('Escape').catch(() => {});
-    await forceCloseOverlays();
-    await sleep(100);
+  console.log(`[Step] Selected pair: ${pair}`);
+  await page.keyboard.press('Escape').catch(() => {});
+  await forceCloseOverlays();
+  await sleep(100);
 
-    lastPairCache = pair;
-  } catch (err) {
-    const ts = Date.now();
-    const screenshotPath = path.join(SCREEN_DIR, `selectPair_fail_${pair}_${ts}.png`);
-    try {
-      await page.screenshot({ path: screenshotPath, fullPage: true });
-      console.log(`[📸] Saved screenshot on selectPair fail: ${screenshotPath}`);
-    } catch (ssErr) {
-      console.error("[❌] Screenshot failed:", ssErr.message);
-    }
-    throw err;
-  }
+  lastPairCache = pair;
 }
 
 function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "", chain_id = "", closed_at = "") {
@@ -172,28 +152,12 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", e
   console.log(`[Step] Trade request: ${direction.toUpperCase()} ${pair} $${amount} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""}`);
   await ensurePageAlive();
   await ensureOnPO();
-
   await forceCloseOverlays();
 
-  try {
-    await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
-  } catch (err) {
-    const ts = Date.now();
-    const screenshotPath = path.join(SCREEN_DIR, `failed_selectPair_${pair}_${ts}.png`);
-    try {
-      await page.screenshot({ path: screenshotPath, fullPage: true });
-      console.log(`[📸] Saved selectPair screenshot: ${screenshotPath}`);
-    } catch (ssErr) {
-      console.error("[❌] Failed to capture selectPair screenshot:", ssErr.message);
-    }
-    tradeInProgress = false;
-    throw err;
-  }
+  await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
 
   console.log("[Step] Setting amount…");
   await withRetry(async () => { await setTradeAmount(amount); }, 2, "setTradeAmount");
-
-  await forceCloseOverlays();
 
   const panel = page.locator(SEL.tradePanel).first();
   const btn = direction.toLowerCase() === 'buy'
@@ -203,30 +167,12 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", e
   await btn.scrollIntoViewIfNeeded().catch(() => {});
   await btn.waitFor({ state: 'visible', timeout: DEFAULT_TIMEOUT });
   console.log(`[CLICK] ${direction.toUpperCase()} button for ${pair} @ $${amount}`);
-
-  try {
-    await btn.click({ timeout: DEFAULT_TIMEOUT, force: true });
-  } catch (err) {
-    console.error("[❌] Button click failed:", err.message);
-    const ts = Date.now();
-    const screenshotPath = path.join(SCREEN_DIR, `failed_click_${pair}_${direction}_${ts}.png`);
-    try {
-      await page.screenshot({ path: screenshotPath, fullPage: true });
-      console.log(`[📸] Saved screenshot: ${screenshotPath}`);
-    } catch (ssErr) {
-      console.error("[❌] Failed to capture screenshot:", ssErr.message);
-    }
-    tradeInProgress = false;
-    throw err;
-  }
+  await btn.click({ timeout: DEFAULT_TIMEOUT, force: true });
 
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""}`);
   tradeInProgress = false;
 
   lastTradeMeta = { amount: Number(amount), ts: Date.now(), pair, direction, ml_tag, chain_id, closed_at: null };
-
-  lastPairCache = pair;
-  lastDirectionCache = direction;
 
   const ts = new Date().toISOString();
   appendLog(ts, pair, direction, amount, "OPEN", 0.0, ml_tag, chain_id, "");
@@ -245,7 +191,7 @@ function recordClosedTrade(meta) {
   if (!chain_id) return;
   if (!recentTrades[chain_id]) recentTrades[chain_id] = [];
   recentTrades[chain_id].unshift(meta);
-  recentTrades[chain_id] = recentTrades[chain_id].filter(t => Date.now() - new Date(t.closed_at).getTime() < 600000); // 10min TTL
+  recentTrades[chain_id] = recentTrades[chain_id].filter(t => Date.now() - new Date(t.closed_at).getTime() < 600000);
   if (recentTrades[chain_id].length > 5) recentTrades[chain_id].pop();
   lastTradeMeta = meta;
 }
@@ -254,41 +200,42 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
   let profit = 0.0, result = "LOSS", closed_at = new Date().toISOString();
   try {
     await page.locator(SEL.closedTab).click({ timeout: 1000 });
-    await page.waitForTimeout(1000); // 1s wait for PO lag
+    await page.waitForTimeout(1000);
     let attempt = 0;
-    while (attempt < 3) { // 3 attempts with 500ms gaps
+    while (attempt < 3) {
       const rows = await page.locator(SEL.closedRow).all();
       for (let row of rows) {
         const rowText = await row.innerText();
-        console.log(`[Debug] Checking row text: ${rowText}`);
         const isBuy = rowText.toUpperCase().includes("BUY") || rowText.toUpperCase().includes("CALL") || rowText.includes("↑");
         const isSell = rowText.toUpperCase().includes("SELL") || rowText.toUpperCase().includes("PUT") || rowText.includes("↓");
-        const detectedDirection = isBuy ? "BUY" : isSell ? "SELL" : null;
-        console.log(`[Debug] Detected direction: ${detectedDirection}`);
+        let detectedDirection = isBuy ? "BUY" : isSell ? "SELL" : null;
+
+        // fallback if null: infer from profit sign
+        if (!detectedDirection && rowText.match(/\$-?[0-9.]+/)) {
+          const val = parseFloat(rowText.match(/\$-?[0-9.]+/)[0].replace("$",""));
+          detectedDirection = val >= 0 ? direction.toUpperCase() : direction.toUpperCase();
+        }
+
         const matchesDirection = detectedDirection && (direction.toUpperCase() === detectedDirection);
         if (rowText.includes(String(amount)) && rowText.includes(pair) && matchesDirection && rowText.match(/\d{2}:\d{2}:\d{2}/)) {
-          const amountNode = await row.locator('.amount').first();
-          const closeTimeNode = await row.locator('.close-time').first();
           const profitMatches = rowText.match(/\$-?[0-9.]+/g);
           if (profitMatches?.length) {
             profit = parseFloat(profitMatches[profitMatches.length - 1].replace("$", ""));
             result = profit > 0 ? "WIN" : "LOSS";
           }
-          if (closeTimeNode) {
-            const timeStr = await closeTimeNode.innerText();
+          const timeMatch = rowText.match(/\d{2}:\d{2}:\d{2}/);
+          if (timeMatch) {
             const now = new Date();
-            closed_at = new Date(now.toDateString() + " " + timeStr + " UTC").toISOString();
+            closed_at = new Date(now.toDateString() + " " + timeMatch[0] + " UTC").toISOString();
           }
-          break; // Changed from return to break
+          break;
         }
       }
       attempt++;
-      if (attempt < 3) await page.waitForTimeout(500); // Wait before retry
+      if (attempt < 3) await page.waitForTimeout(500);
     }
   } catch (err) {
     console.error("[❌] Result parse failed:", err.message);
-    const allRows = await page.locator(SEL.closedRow).all().map(r => r.innerText());
-    console.log("[FALLBACK] All closed rows:", allRows);
   }
 
   const meta = { amount, pair, direction, ml_tag, chain_id, profit, result, closed_at };
@@ -296,7 +243,7 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
 
   const ts2 = new Date().toISOString();
   appendLog(ts2, pair, direction, amount, result, profit, ml_tag, chain_id, closed_at);
-  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""} ${chain_id ? `[chain=${chain_id}]` : ""} closed_at=${closed_at}`);
+  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} [${ml_tag}] [chain=${chain_id}] closed_at=${closed_at}`);
 }
 
 // ----------------------------- Peek Endpoint --------------------------------
@@ -344,14 +291,7 @@ app.get("/peek", async (req, res) => {
       closed_at: result.closed_at || null
     });
   } catch (err) {
-    return res.json({
-      ok: false,
-      error: err?.message || String(err),
-      profit: 0,
-      ml_tag: "",
-      chain_id: "",
-      closed_at: null
-    });
+    return res.json({ ok: false, error: err?.message || String(err), profit: 0, ml_tag: "", chain_id: "", closed_at: null });
   }
 });
 
