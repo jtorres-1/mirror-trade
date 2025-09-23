@@ -254,30 +254,41 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
   let profit = 0.0, result = "LOSS", closed_at = new Date().toISOString();
   try {
     await page.locator(SEL.closedTab).click({ timeout: 1000 });
-    const rows = await page.locator(SEL.closedRow).all();
-    await page.waitForTimeout(500); // Brief wait for rows to stabilize
-    for (let row of rows) {
-      const rowText = await row.innerText();
-      console.log(`[Debug] Checking row text: ${rowText}`);
-      if (rowText.includes(String(amount)) && rowText.match(/\d{2}:\d{2}:\d{2}/)) {
-        const amountNode = await row.locator('.amount').first();
-        const closeTimeNode = await row.locator('.close-time').first();
-        const profitMatches = rowText.match(/\$-?[0-9.]+/g);
-        if (profitMatches?.length) {
-          profit = parseFloat(profitMatches[profitMatches.length - 1].replace("$", ""));
-          result = profit > 0 ? "WIN" : "LOSS";
+    await page.waitForTimeout(1000); // 1s wait for PO lag
+    let attempt = 0;
+    while (attempt < 3) { // 3 attempts with 500ms gaps
+      const rows = await page.locator(SEL.closedRow).all();
+      for (let row of rows) {
+        const rowText = await row.innerText();
+        console.log(`[Debug] Checking row text: ${rowText}`);
+        const isBuy = rowText.toUpperCase().includes("BUY") || rowText.toUpperCase().includes("CALL") || rowText.includes("↑");
+        const isSell = rowText.toUpperCase().includes("SELL") || rowText.toUpperCase().includes("PUT") || rowText.includes("↓");
+        const detectedDirection = isBuy ? "BUY" : isSell ? "SELL" : null;
+        console.log(`[Debug] Detected direction: ${detectedDirection}`);
+        const matchesDirection = detectedDirection && (direction.toUpperCase() === detectedDirection);
+        if (rowText.includes(String(amount)) && rowText.includes(pair) && matchesDirection && rowText.match(/\d{2}:\d{2}:\d{2}/)) {
+          const amountNode = await row.locator('.amount').first();
+          const closeTimeNode = await row.locator('.close-time').first();
+          const profitMatches = rowText.match(/\$-?[0-9.]+/g);
+          if (profitMatches?.length) {
+            profit = parseFloat(profitMatches[profitMatches.length - 1].replace("$", ""));
+            result = profit > 0 ? "WIN" : "LOSS";
+          }
+          if (closeTimeNode) {
+            const timeStr = await closeTimeNode.innerText();
+            const now = new Date();
+            closed_at = new Date(now.toDateString() + " " + timeStr + " UTC").toISOString();
+          }
+          return; // Exit on match
         }
-        if (closeTimeNode) {
-          const timeStr = await closeTimeNode.innerText();
-          const now = new Date();
-          closed_at = new Date(now.toDateString() + " " + timeStr + " UTC").toISOString();
-        }
-        break;
       }
-      await page.waitForTimeout(500); // Prevent tight looping
+      attempt++;
+      if (attempt < 3) await page.waitForTimeout(500); // Wait before retry
     }
   } catch (err) {
     console.error("[❌] Result parse failed:", err.message);
+    const allRows = await page.locator(SEL.closedRow).all().map(r => r.innerText());
+    console.log("[FALLBACK] All closed rows:", allRows);
   }
 
   const meta = { amount, pair, direction, ml_tag, chain_id, profit, result, closed_at };
