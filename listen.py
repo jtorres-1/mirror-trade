@@ -207,7 +207,7 @@ def executor_trade(pair, amount, direction, ml_tag, chain_id) -> Dict:
             print(f"[API ERROR] {r.status_code}: {r.text}")
     except Exception as e:
         print(f"[API EXCEPTION] {e}")
-    return {"success": false, "result": "OPEN", "profit": 0}
+    return {"success": False, "result": "OPEN", "profit": 0}
 
 async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> None:
     global executor_busy, daily_pnl, halted_for_day, ml1_task, ml2_task, last_win_chain
@@ -305,7 +305,6 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
         await asyncio.sleep(delay)
 
         if ml_label in (1, 2):
-            # Removed while datetime.utcnow() < prev_close loop
             # Asynchronous WIN check (non-blocking, reduced to 3s)
             async def check_win():
                 start = datetime.utcnow()
@@ -315,7 +314,7 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
                         if current["expected_close"]:
                             try:
                                 closed_dt = datetime.fromisoformat(closed_at) if closed_at else None
-                                if closed_dt and abs((closed_dt - current["expected_close"]).total_seconds()) <= 7:  # Increased to ±7s
+                                if closed_dt and abs((closed_dt - current["expected_close"]).total_seconds()) <= 7:
                                     last_win_chain = cid
                                     reset_chain(f"{label} cancelled: WIN via /peek (profit {p}, tag={tag}) [chain={cid}]")
                                     return True
@@ -366,7 +365,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
         print("[INFO] Rapid signal ignored.")
         return True
 
-    # ── FIX: Guard only if chain_id exists ───────────────────────────────
+    # ── FIX: Guard only if chain_id exists, refined to 3s ──────────────────────
     should_block = True
     cid = current["chain_id"]
     if not cid:  # no active chain, nothing to block
@@ -374,17 +373,17 @@ async def handle_signal_from_text(text: str, msg_date=None):
     else:
         for _ in range(15):  # 3s total (15 retries x 0.2s)
             ok, p, tag, peek_chain, closed_at = quick_peek(cid)
-            if not ok or p != 0:
-                if p > 0:
+            if not ok or (p != 0 and peek_chain == cid):
+                if p > 0 and peek_chain == cid:
                     last_win_chain = cid
                     reset_chain(f"WIN detected via /peek (profit {p}, tag={tag}) [chain={cid}]")
-                should_block = false
+                should_block = False
                 break
             await asyncio.sleep(0.2)
         if should_block:
             reset_chain(f"Forced reset: /peek unresolved for chain {cid}")
             should_block = False
-    # ─────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
 
     if should_block:
         print("[GUARD] Skipping new BASE: unresolved trade still open.")
