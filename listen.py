@@ -1,8 +1,4 @@
 # listen.py — Telegram -> PocketOption with martingale (anchored ML, tight gaps, no ghosts, chain fingerprint)
-# Patched: consumes chain_id from Node executor to ensure cancels only apply to the correct chain.
-# Added: expected_close validation so past wins can't cancel the wrong chain.
-# Refined: overwrite expected_close with closed_at from Node, ±7s tolerance. [Updated]
-# Fixed: guard now skips /peek if no active chain_id, preventing stale-blocks.
 
 import os, re, csv, asyncio, sys, requests, emoji, uuid
 from datetime import datetime, timedelta, timezone
@@ -27,9 +23,9 @@ mg_mult         = float(os.getenv("MARTINGALE_MULT", "2.2"))
 MAX_STAKE       = float(os.getenv("MAX_STAKE", "10.65"))
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
 
-SKEW_MS       = int(os.getenv("SKEW_MS", "2380"))
-ML1_GAP_S     = float(os.getenv("ML1_GAP_S", "1"))  # Updated to 1 second
-ML2_GAP_S     = float(os.getenv("ML2_GAP_S", "0.25"))  # Updated to 0.25 seconds
+SKEW_MS   = int(os.getenv("SKEW_MS", "2380"))      # base fires ~2.3s early
+ML1_GAP_S = float(os.getenv("ML1_GAP_S", "1.0"))   # anchored gap after base close
+ML2_GAP_S = float(os.getenv("ML2_GAP_S", "0.25"))  # anchored gap after ML1 close
 
 if not api_id or not api_hash:
     print("[FATAL] API_ID/API_HASH missing in .env"); sys.exit(1)
@@ -73,10 +69,8 @@ def parse_signal(text: str) -> Optional[Dict]:
     if looks_like_summary(norm):
         return None
     d = {"pair": None, "direction": None, "expiry_min": None, "entry_time": None}
-
     m_pair = PAIR_RE.search(norm.upper())
     if m_pair: d["pair"] = m_pair.group(1)
-
     lines = [ln.strip() for ln in norm.splitlines() if ln.strip()]
     for ln in lines:
         up = ln.upper()
@@ -88,10 +82,8 @@ def parse_signal(text: str) -> Optional[Dict]:
         if "ENTRY" in up:
             m = TIME_RE.search(ln)
             if m: d["entry_time"] = m.group(1)
-
     if d["expiry_min"] is None:
         d["expiry_min"] = 5
-
     if d["pair"] and d["direction"] and d["entry_time"]:
         return d
     return None
@@ -107,25 +99,24 @@ def et_day_key() -> str:
     now_et = now_utc + timedelta(minutes=tz_offset_minutes)
     return now_et.strftime("%Y-%m-%d")
 
+# ── Trade State ──────────────────────────────────────────────────────────────
 current = {
     "active": False, "pair": None, "direction": None, "expiry_min": 5,
     "amount": base_amount,
-    "base_exec_at": None,
-    "ml1_exec_at": None,
     "chain_id": None,
     "expected_close": None
 }
 last_signal_utc: Optional[datetime] = None
 seen_ids = set()
 
+executor_busy = False
 daily_pnl = 0.0
 halted_for_day = False
-executor_busy = False
 
 scheduled_tasks = []
-ttl_task = None
 ml1_task = None
 ml2_task = None
+ttl_task = None
 
 def cancel_task(t):
     try:
@@ -135,50 +126,29 @@ def cancel_task(t):
         pass
 
 def cancel_all_tasks():
-    global scheduled_tasks, ttl_task, ml1_task, ml2_task
-    for t in scheduled_tasks:
-        cancel_task(t)
-    cancel_task(ttl_task); ttl_task = None
+    global scheduled_tasks, ml1_task, ml2_task, ttl_task
+    for t in scheduled_tasks: cancel_task(t)
     cancel_task(ml1_task); ml1_task = None
     cancel_task(ml2_task); ml2_task = None
+    cancel_task(ttl_task); ttl_task = None
     scheduled_tasks = []
-
-def arm_ttl(until_dt: datetime, why: str):
-    global ttl_task
-    cancel_task(ttl_task)
-    async def _ttl(deadline_dt: datetime, cid: str):
-        try:
-            await asyncio.sleep(max(0, (deadline_dt - datetime.utcnow()).total_seconds() + 60))
-            if current["active"] and current["chain_id"] == cid:
-                reset_chain("TTL watchdog expired")
-        except asyncio.CancelledError:
-            return
-    cid = current["chain_id"]
-    ttl_task = asyncio.create_task(_ttl(until_dt, cid))
-    scheduled_tasks.append(ttl_task)
-    print(f"[TTL] armed until {until_dt} ({why}) [chain={cid}]")
 
 def reset_chain(reason=""):
     cancel_all_tasks()
     current.update({
         "active": False, "pair": None, "direction": None,
         "expiry_min": 5, "amount": base_amount,
-        "base_exec_at": None, "ml1_exec_at": None,
         "chain_id": None, "expected_close": None
     })
-    if reason: print(f"[RESET] {reason}")
-    else:      print("[RESET] Chain cleared.")
+    print(f"[RESET] {reason}" if reason else "[RESET] Chain cleared.")
 
-last_win_ping_utc: Optional[datetime] = None
-last_win_chain: Optional[str] = None
-WIN_HINT_RE = re.compile(r'\bWIN\b|\bVICTORY\b', re.I)
-
+# ── Executor / Peek ──────────────────────────────────────────────────────────
 PO_URL = "http://localhost:3000"
 
 def force_otc(pair: str) -> str:
     return pair if (not FORCE_OTC or "OTC" in pair.upper()) else f"{pair} OTC"
 
-def quick_peek(chain_id: str) -> (bool, float, str, str, Optional[str]):
+def quick_peek(chain_id: str):
     try:
         r = requests.get(f"{PO_URL}/peek", params={"chain_id": chain_id}, timeout=1.5)
         if r.status_code == 200:
@@ -209,14 +179,10 @@ def executor_trade(pair, amount, direction, ml_tag, chain_id) -> Dict:
         print(f"[API EXCEPTION] {e}")
     return {"success": False, "result": "OPEN", "profit": 0}
 
+# ── Trade Execution ──────────────────────────────────────────────────────────
 async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> None:
-    global executor_busy, daily_pnl, halted_for_day, ml1_task, ml2_task, last_win_chain
-    if DAILY_STOP_LOSS > 0 and daily_pnl <= -DAILY_STOP_LOSS:
-        print("[HALT] Daily stop loss reached. Skip trade.")
-        return
-    if executor_busy:
-        print("[BLOCK] Executor busy; skipping overlapping call.")
-        return
+    global executor_busy, ml1_task, ml2_task
+    if executor_busy: return
     executor_busy = True
 
     clean_pair = force_otc(pair)
@@ -227,76 +193,44 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
         data = await asyncio.get_event_loop().run_in_executor(
             None, lambda: executor_trade(clean_pair, amount, direction, ml_tag, chain_id)
         )
-        result = data.get("result", "OPEN")
         profit = float(data.get("profit", 0))
-        log_trade(clean_pair, direction, expiry_min, amount, result, profit, ml_tag, chain_id)
-        print(f"[API] Fired: {direction} {clean_pair} ${amount} [{ml_tag}] [chain={chain_id}] → {result}")
+        log_trade(clean_pair, direction, expiry_min, amount, data.get("result", "OPEN"), profit, ml_tag, chain_id)
+        print(f"[API] Fired: {direction} {clean_pair} ${amount} [{ml_tag}] [chain={chain_id}]")
 
         exec_time = datetime.utcnow()
         current["expected_close"] = exec_time + timedelta(minutes=expiry_min)
 
-        # Poll /peek to update expected_close
-        start = datetime.utcnow()
-        while (datetime.utcnow() - start).total_seconds() < 5.0:
-            ok, p, tag, peek_chain, closed_at = quick_peek(chain_id)
-            if ok and peek_chain == chain_id and closed_at:
-                try:
-                    closed_dt = datetime.fromisoformat(closed_at)
-                    current["expected_close"] = closed_dt
-                    print(f"[UPDATE] expected_close set to {closed_dt} from /peek [chain={chain_id}]")
-                    break
-                except:
-                    pass
-            await asyncio.sleep(0.2)
-
-        # Force cancels on all wins
         if profit > 0:
-            last_win_chain = chain_id
-            if ml_label is None:  # Fixed from ml_label == 0 to ml_label is None for Base
-                cancel_task(ml1_task); ml1_task = None
-                cancel_task(ml2_task); ml2_task = None
-                reset_chain(f"Base WIN — cancelled ML1 and ML2. [chain={last_win_chain}]")
+            if ml_label is None:
+                cancel_task(ml1_task); cancel_task(ml2_task)
+                reset_chain("Base WIN — cancelled ML1/ML2")
             elif ml_label == 1:
-                cancel_task(ml2_task); ml2_task = None
-                reset_chain(f"ML1 WIN — cancelled ML2. [chain={last_win_chain}]")
+                cancel_task(ml2_task)
+                reset_chain("ML1 WIN — cancelled ML2")
             elif ml_label == 2:
-                reset_chain(f"ML2 WIN — chain complete. [chain={last_win_chain}]")
+                reset_chain("ML2 WIN — chain complete")
             return
         elif ml_label == 2 and profit <= 0:
-            reset_chain(f"ML2 LOSS — chain complete. [chain={chain_id}]")
+            reset_chain("ML2 LOSS — chain complete")
             return
-        elif ml_label is None and profit <= 0:
-            last_win_chain = None
 
-        if ml_label is None:
-            current["base_exec_at"] = exec_time
+        # Anchor ML levels
+        if ml_label is None:  # base
             base_close = exec_time + timedelta(minutes=expiry_min)
             ml1_fire = base_close + timedelta(seconds=ML1_GAP_S)
             cancel_task(ml1_task)
             ml1_task = asyncio.create_task(schedule_leg(ml1_fire, 1, base_close, chain_id))
-            print(f"[CHAIN] ML1 anchored → {ml1_fire} (gap {ML1_GAP_S:.2f}s after base close)")
-            arm_ttl(base_close + timedelta(minutes=expiry_min, seconds=30), "base->ml1 span")
-
+            print(f"[CHAIN] ML1 anchored {ml1_fire}")
         elif ml_label == 1:
-            current["ml1_exec_at"] = exec_time
             ml1_close = exec_time + timedelta(minutes=expiry_min)
             ml2_fire = ml1_close + timedelta(seconds=ML2_GAP_S)
             cancel_task(ml2_task)
             ml2_task = asyncio.create_task(schedule_leg(ml2_fire, 2, ml1_close, chain_id))
-            print(f"[CHAIN] ML2 anchored → {ml2_fire} (gap {ML2_GAP_S:.2f}s after ML1 close)")
-            arm_ttl(ml1_close + timedelta(minutes=expiry_min, seconds=30), "ml1->ml2 span")
-
-        elif ml_label == 2:
-            if profit > 0:
-                reset_chain(f"ML2 WIN — chain complete. [chain={last_win_chain}]")
-                return
-            else:
-                reset_chain(f"ML2 LOSS — chain complete. [chain={chain_id}]")
-                return
+            print(f"[CHAIN] ML2 anchored {ml2_fire}")
     finally:
         executor_busy = False
 
-# ── Scheduling with guard (patched) ──────────────────────────────
+# ── Scheduler ────────────────────────────────────────────────────────────────
 async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: Optional[datetime] = None, cid: Optional[str] = None):
     label = "BASE" if ml_label is None else f"ML{ml_label}"
     delay = max(0.0, (fire_dt - datetime.utcnow()).total_seconds())
@@ -306,27 +240,16 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
         await asyncio.sleep(delay)
 
         if ml_label in (1, 2):
-            # Asynchronous WIN check (non-blocking, extended to 5s)
-            async def check_win():
-                start = datetime.utcnow()
-                while (datetime.utcnow() - start).total_seconds() < 5.0:  # Extended from 3.0 to 5.0
-                    ok, p, tag, peek_chain, closed_at = quick_peek(cid)
-                    if ok and p > 0 and peek_chain == cid:
-                        if current["expected_close"]:
-                            try:
-                                closed_dt = datetime.fromisoformat(closed_at) if closed_at else None
-                                if closed_dt and abs((closed_dt - current["expected_close"]).total_seconds()) <= 7:
-                                    last_win_chain = cid
-                                    reset_chain(f"{tag} cancelled: WIN via /peek (profit {p}) [chain={cid}]")
-                                    return True
-                            except:
-                                pass
-                    await asyncio.sleep(0.2)
-                return False
-
-            win_detected = await check_win()
-            if win_detected:
-                return
+            start = datetime.utcnow()
+            while (datetime.utcnow() - start).total_seconds() < 5.0:  # 5s window
+                ok, p, tag, peek_chain, closed_at = quick_peek(cid)
+                if ok and p > 0 and peek_chain == cid:
+                    if current["expected_close"] and closed_at:
+                        closed_dt = datetime.fromisoformat(closed_at)
+                        if abs((closed_dt - current["expected_close"]).total_seconds()) <= 7:
+                            reset_chain(f"{tag} cancelled: WIN via /peek [chain={cid}]")
+                            return
+                await asyncio.sleep(0.2)
 
         amt = base_amount if ml_label is None else min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
         await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=ml_label)
@@ -334,112 +257,52 @@ async def schedule_leg(fire_dt: datetime, ml_label: Optional[int], prev_close: O
         print(f"[CANCEL] {label} cancelled.")
         return
 
+# ── Signal Handling ──────────────────────────────────────────────────────────
 async def handle_signal_from_text(text: str, msg_date=None):
-    global last_signal_utc, daily_pnl, halted_for_day, current, scheduled_tasks, last_win_ping_utc, ml1_task, ml2_task
-    if WIN_HINT_RE.search(text):
-        last_win_ping_utc = datetime.utcnow()
-        return False
+    global last_signal_utc
     sig = parse_signal(text)
-    if not sig:
-        return False
-    if not msg_date:
-        msg_date = datetime.utcnow().replace(tzinfo=timezone.utc)
-
+    if not sig: return False
+    if not msg_date: msg_date = datetime.utcnow().replace(tzinfo=timezone.utc)
     base_dt = resolve_entry_datetime(sig["entry_time"], msg_date.replace(tzinfo=None))
-    if (datetime.utcnow() - base_dt).total_seconds() > 300:
-        print(f"[INFO] Signal {sig['entry_time']} too old; ignoring.")
-        return True
-
-    if not hasattr(handle_signal_from_text, "_day"):
-        handle_signal_from_text._day = et_day_key()
-    if et_day_key() != handle_signal_from_text._day:
-        daily_pnl = 0.0; halted_for_day = False
-        handle_signal_from_text._day = et_day_key()
-        reset_chain("ET day rollover")
-
-    if DAILY_STOP_LOSS > 0 and halted_for_day:
-        print("[HALT] Stop loss hit; ignoring signals.")
-        return True
-
-    now_utc = datetime.utcnow()
-    if last_signal_utc and (now_utc - last_signal_utc).total_seconds() < 60:
-        print("[INFO] Rapid signal ignored.")
-        return True
-
-    # ── FIX: Guard only if chain_id exists, refined to 3s ──────────────────────
-    should_block = True
-    cid = current["chain_id"]
-    if not cid:  # no active chain, nothing to block
-        should_block = False
-    else:
-        for _ in range(15):  # 3s total (15 retries x 0.2s)
-            ok, p, tag, peek_chain, closed_at = quick_peek(cid)
-            if not ok or (p != 0 and peek_chain == cid):
-                if p > 0 and peek_chain == cid:
-                    last_win_chain = cid
-                    reset_chain(f"WIN detected via /peek (profit {p}, tag={tag}) [chain={cid}]")
-                should_block = False
-                break
-            await asyncio.sleep(0.2)
-        if should_block:
-            reset_chain(f"Forced reset: /peek unresolved for chain {cid}")
-            should_block = False
-    # ─────────────────────────────────────────────────────────────────────────
-
-    if should_block:
-        print("[GUARD] Skipping new BASE: unresolved trade still open.")
-        return True
-    if current["active"]:
-        print("[INFO] Chain active; ignoring new signal.")
-        return True
+    if (datetime.utcnow() - base_dt).total_seconds() > 300: return True
+    if current["active"]: return True
 
     cid = str(uuid.uuid4())[:8]
     current.update({
         "active": True, "pair": force_otc(sig["pair"]), "direction": sig["direction"],
         "expiry_min": sig["expiry_min"], "amount": base_amount,
-        "base_exec_at": None, "ml1_exec_at": None, "chain_id": cid, "expected_close": None
+        "chain_id": cid, "expected_close": None
     })
-    last_signal_utc = now_utc
+    last_signal_utc = datetime.utcnow()
     print(f"[SIGNAL] {current['pair']} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} [chain={cid}]")
-
-    cancel_task(ml1_task); ml1_task = None
-    cancel_task(ml2_task); ml2_task = None
 
     base_fire = base_dt - timedelta(milliseconds=SKEW_MS)
     t0 = asyncio.create_task(schedule_leg(base_fire, None, cid=cid)); scheduled_tasks.append(t0)
-
-    arm_ttl(base_fire + timedelta(minutes=current["expiry_min"], seconds=45), "base window")
     return True
 
 async def on_signal(e):
-    if e.message.id in seen_ids:
-        return
+    if e.message.id in seen_ids: return
     seen_ids.add(e.message.id)
     text = (e.message.message or "").strip()
     print("[TG RAW]", text.replace("\n"," | ")[:500])
     ok = await handle_signal_from_text(text, msg_date=e.message.date)
-    if not ok:
-        print("[TG DEBUG] Ignored: no valid trading signal")
+    if not ok: print("[TG DEBUG] Ignored")
 
 async def main():
-    print("[DEBUG] Starting Telegram client...")
+    print("[DEBUG] Starting Telegram client…")
     await client.connect()
     if not await client.is_user_authorized():
         await client.send_code_request(phone)
-        code = input("Enter the Telegram code: ").strip()
-        try:
-            await client.sign_in(phone, code)
+        code = input("Enter Telegram code: ").strip()
+        try: await client.sign_in(phone, code)
         except SessionPasswordNeededError:
-            pw = input("Enter your 2FA password: ").strip()
+            pw = input("Enter 2FA password: ").strip()
             await client.sign_in(password=pw)
     me = await client.get_me()
-    print(f"[DEBUG] Logged in as: {me.username or me.first_name} (ID {me.id})")
     entity = await client.get_entity(channel)
-    print(f"[DEBUG] Listening to: {getattr(entity,'title',None)} (ID {entity.id})")
     client.add_event_handler(on_signal, events.NewMessage(chats=entity))
-    print("[DEBUG] Pocket Option trade screen ready (via Node API).")
+    print("[DEBUG] Pocket Option trade screen ready.")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    with client:
-        client.loop.run_until_complete(main())
+    with client: client.loop.run_until_complete(main())
