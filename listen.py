@@ -249,21 +249,22 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
                     pass
             await asyncio.sleep(0.2)
 
-        # Cancel on win
+        # Force cancels on all wins
         if profit > 0:
             last_win_chain = chain_id
-            if ml_label is None:
+            if ml_label == 0:
                 cancel_task(ml1_task); ml1_task = None
                 cancel_task(ml2_task); ml2_task = None
-                reset_chain(f"Base WIN — cancelled future ML legs. [chain={last_win_chain}]")
-                return
+                reset_chain(f"Base WIN — cancelled ML1 and ML2. [chain={last_win_chain}]")
             elif ml_label == 1:
                 cancel_task(ml2_task); ml2_task = None
                 reset_chain(f"ML1 WIN — cancelled ML2. [chain={last_win_chain}]")
-                return
             elif ml_label == 2:
                 reset_chain(f"ML2 WIN — chain complete. [chain={last_win_chain}]")
-                return
+            return
+        elif ml_label == 2 and profit <= 0:
+            reset_chain(f"ML2 LOSS — chain complete. [chain={chain_id}]")
+            return
         elif ml_label is None and profit <= 0:
             last_win_chain = None
 
