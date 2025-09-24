@@ -1,6 +1,6 @@
 # listen.py — Telegram -> PocketOption with martingale
-# Fix: Anchor entry_time to msg_date ET to resolve AM/PM and overnight sessions
-# Patch: Cancel shield — base/ML1 win cancels all pending ML levels
+# Fix: Sequential ML controller — no pre-scheduling, next ML only after result
+# Cancel shield included
 
 import os, re, csv, asyncio, sys, requests
 from datetime import datetime, timedelta, timezone
@@ -115,19 +115,15 @@ def parse_signal(text: str) -> Optional[Dict]:
 
 # --- Time handling ---
 def resolve_entry_datetime(hhmm: str, msg_date_utc: datetime) -> datetime:
-    """Resolve ET hh:mm to proper UTC datetime using msg_date as anchor"""
     hh, mm = map(int, hhmm.split(":"))
     msg_et = msg_date_utc + timedelta(minutes=tz_offset_minutes)
     candidate = msg_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
-    # If candidate is more than 6h before msg time, assume it's next day
     if (candidate - msg_et).total_seconds() < -6*3600:
         candidate += timedelta(days=1)
-    # If candidate is more than 18h ahead, roll back a day (mis-AM/PM)
     elif (candidate - msg_et).total_seconds() > 18*3600:
         candidate -= timedelta(days=1)
 
-    # Convert back to UTC
     return candidate - timedelta(minutes=tz_offset_minutes)
 
 def et_day_key() -> str:
@@ -140,13 +136,10 @@ current = {"active": False,"pair": None,"direction": None,"expiry_min": 5,
            "ml_levels": [],"ml_i": 0,"amount": base_amount}
 last_signal_utc: Optional[datetime] = None
 seen_ids = set()
-scheduled_tasks = []
 
 daily_pnl = 0.0
 halted_for_day = False
 executor_busy = False
-
-# NEW: cancel shield flag
 chain_active = True
 
 async def sleep_until(when: datetime):
@@ -155,9 +148,8 @@ async def sleep_until(when: datetime):
 
 # --- Run one trade ---
 async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> bool:
-    global executor_busy, daily_pnl, halted_for_day, chain_active, current, scheduled_tasks
+    global executor_busy, daily_pnl, halted_for_day, chain_active, current
 
-    # Guard: if chain already cancelled, abort silently
     if not chain_active:
         print(f"[CANCEL] Chain inactive, aborting {ml_label or 'BASE'} trade.")
         return False
@@ -201,63 +193,44 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> b
 
     print(f"[API] Trade done: {direction} {clean_pair} ${amount} → {result} ({profit}) [{ml_tag}]")
 
-    # NEW: hard cancel on WIN
     if success:
-        print("[CANCEL] WIN detected — cancelling all future ML tasks.")
+        print("[CANCEL] WIN detected — chain ends here.")
         chain_active = False
-        for t in scheduled_tasks:
-            if not t.done():
-                t.cancel()
-        scheduled_tasks.clear()
         current.update({"active": False,"pair": None,"direction": None,
                         "ml_levels": [],"ml_i": 0,"amount": base_amount})
-
     return success
 
-# --- ML scheduling ---
-async def schedule_entry(entry_dt: datetime, ml_label=None):
-    global current, scheduled_tasks, chain_active
-    if DAILY_STOP_LOSS > 0 and halted_for_day:
-        print("[HALT] Daily stop-loss reached; skip scheduled entry.")
-        return
+# --- Sequential ML controller ---
+async def run_chain(entry_dt: datetime):
+    global current, chain_active
 
-    print(f"[TIME] Target {entry_dt} (UTC)  now {datetime.utcnow()}")
     await sleep_until(entry_dt)
-
-    # Guard: cancel shield
-    if not chain_active:
-        print(f"[CANCEL] Chain inactive at schedule time, aborting {ml_label or 'BASE'} entry.")
-        return
-
-    pair, direction, expiry = current["pair"], current["direction"], current["expiry_min"]
     amt = min(current["amount"], MAX_STAKE)
-    label_str = f"ML{ml_label}" if ml_label else "BASE"
-    print(f"[EXECUTE] {pair} {direction} {expiry}m amount {amt} ({label_str}) @ {datetime.utcnow()}")
+    print(f"[EXECUTE] BASE {current['pair']} {current['direction']} {amt}")
+    win = await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=None)
+    if win: return
 
-    won = await run_one_trade(pair, direction, expiry, amt, ml_label=ml_label)
-
-    if won:
-        return  # reset already handled in run_one_trade()
-
-    if current["ml_i"] < len(current["ml_levels"]):
-        next_t = current["ml_levels"][current["ml_i"]]
+    # Sequential ML loop
+    while chain_active and current["ml_i"] < len(current["ml_levels"]):
         current["ml_i"] += 1
         if current["ml_i"] >= 3:
-            print("[ML] ML3 disabled; chain ends at ML2.")
-            current.update({"active": False,"pair": None,"direction": None,
-                            "ml_levels": [],"ml_i": 0,"amount": base_amount})
-            chain_active = False
-            return
-        next_amt = round(current["amount"] * mg_mult, 2)
-        current["amount"] = min(next_amt, MAX_STAKE)
-        print(f"[ML] LOSS → scheduling ML{current['ml_i']} at {next_t} amount={current['amount']}")
-        task = asyncio.create_task(schedule_entry(resolve_entry_datetime(next_t, datetime.utcnow()), ml_label=current["ml_i"]))
-        scheduled_tasks.append(task)
-    else:
-        print("[ML] LOSS no levels left → reset")
-        current.update({"active": False,"pair": None,"direction": None,
-                        "ml_levels": [],"ml_i": 0,"amount": base_amount})
-        chain_active = False
+            print("[ML] ML3 disabled; stopping at ML2.")
+            break
+
+        next_t = current["ml_levels"][current["ml_i"] - 1]
+        amt = round(min(current["amount"] * mg_mult, MAX_STAKE), 2)
+        current["amount"] = amt
+
+        next_dt = resolve_entry_datetime(next_t, datetime.utcnow())
+        print(f"[EXECUTE] ML{current['ml_i']} {current['pair']} {current['direction']} {amt} at {next_dt}")
+        await sleep_until(next_dt)
+
+        win = await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=current["ml_i"])
+        if win: break
+
+    chain_active = False
+    current.update({"active": False,"pair": None,"direction": None,
+                    "ml_levels": [],"ml_i": 0,"amount": base_amount})
 
 # --- Telegram handlers ---
 async def handle_signal_from_text(text: str, msg_date=None):
@@ -269,7 +242,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
     entry_dt = resolve_entry_datetime(sig["entry_time"], msg_date.replace(tzinfo=None))
 
     if (datetime.utcnow() - entry_dt).total_seconds() > 300:
-        print(f"[INFO] Signal entry {sig['entry_time']} too old (resolved {entry_dt}); ignoring.")
+        print(f"[INFO] Signal entry {sig['entry_time']} too old; ignoring.")
         return True
 
     if not hasattr(handle_signal_from_text, "_day"):
@@ -292,37 +265,24 @@ async def handle_signal_from_text(text: str, msg_date=None):
         print("[INFO] Chain active; ignoring new signal.")
         return True
 
-    # NEW: reset cancel shield for new chain
     chain_active = True
-
-    pair = sig["pair"]
-    if FORCE_OTC and "OTC" not in pair.upper():
-        pair = f"{pair} OTC"
-    current.update({"active": True,"pair": pair,"direction": sig["direction"],
+    current.update({"active": True,"pair": sig["pair"],"direction": sig["direction"],
                     "expiry_min": sig["expiry_min"],"ml_levels": sig.get("ml_levels", []),
                     "ml_i": 0,"amount": base_amount})
     last_signal_utc = now_utc
-    print(f"[SIGNAL] {pair} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} | ML {sig.get('ml_levels', [])}")
-    task = asyncio.create_task(schedule_entry(entry_dt))
-    scheduled_tasks.append(task)
+    print(f"[SIGNAL] {sig['pair']} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} | ML {sig.get('ml_levels', [])}")
+    asyncio.create_task(run_chain(entry_dt))
     return True
 
 async def on_signal(e):
     if e.message.id in seen_ids:
-        print(f"[INFO] Duplicate message ID {e.message.id} ignored.")
         return
     seen_ids.add(e.message.id)
-    src = getattr(getattr(e, "chat", None), "title", None) or ""
-    username = getattr(getattr(e, "chat", None), "username", None)
-    print(f"[TG DEBUG] Incoming from: '{src}' (@{username})")
     text = (e.message.message or "").strip()
-    print("[TG RAW]", text.replace("\n", " | ")[:500])
-    ok = await handle_signal_from_text(text, msg_date=e.message.date)
-    if not ok: print("[TG DEBUG] Ignored: no valid signal found")
+    await handle_signal_from_text(text, msg_date=e.message.date)
 
 # --- Main ---
 async def main():
-    print("[DEBUG] Starting Telegram client...")
     await client.connect()
     if not await client.is_user_authorized():
         await client.send_code_request(phone)
@@ -333,12 +293,8 @@ async def main():
             pw = input("Enter your Telegram 2FA password: ").strip()
             await client.sign_in(password=pw)
 
-    me = await client.get_me()
-    print(f"[DEBUG] Logged in as: {me.username or me.first_name} (ID {me.id})")
     entity = await client.get_entity(channel)
-    print(f"[DEBUG] Listening to: {getattr(entity, 'title', None)} (ID {entity.id})")
     client.add_event_handler(on_signal, events.NewMessage(chats=entity))
-    print("[DEBUG] Pocket Option trade screen ready (via Node API).")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
