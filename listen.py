@@ -29,7 +29,7 @@ ML1_GAP_S = float(os.getenv("ML1_GAP_S", "1.0"))   # optional tiny gap after bas
 ML2_GAP_S = float(os.getenv("ML2_GAP_S", "0.25"))  # optional tiny gap after ML1 loss
 
 # hybrid poll tuning
-POLL_WINDOW_S  = float(os.getenv("POLL_WINDOW_S", "30"))   # increased from 12s → 30s
+POLL_WINDOW_S  = float(os.getenv("POLL_WINDOW_S", "30"))   # poll window
 POLL_INTERVAL_S = float(os.getenv("POLL_INTERVAL_S", "0.2"))
 
 if not api_id or not api_hash:
@@ -212,19 +212,24 @@ async def wait_outcome_then_decide(expiry_min: int, ml_label: int, cid: str):
             if profit > 0:
                 reset_chain(f"{label} cancelled: WIN via /peek [chain={cid}]")
                 return
+
+            # Loss case
             gap = ML1_GAP_S if ml_label == 1 else ML2_GAP_S
-            if gap > 0 and ml_label < 2:
+            if gap > 0:
                 await asyncio.sleep(gap)
-            if ml_label < 2:  # Only fire next if not ML2
+
+            if ml_label == 1:  # ML1 lost → fire ML2
                 amt = min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
-                await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=ml_label)
+                await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=2)
                 return
-            else:
+
+            if ml_label == 2:  # ML2 lost → reset
                 reset_chain(f"{label} LOSS confirmed [chain={cid}]")
                 return
+
         await asyncio.sleep(POLL_INTERVAL_S)
 
-    # Failsafe reset — no result found within poll window
+    # Failsafe reset if nothing matched
     if ml_label == 2:
         reset_chain(f"{label} assumed LOSS (no result) [chain={cid}]")
     else:
