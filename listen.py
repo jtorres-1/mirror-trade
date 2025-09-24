@@ -213,14 +213,22 @@ async def wait_outcome_then_decide(expiry_min: int, ml_label: int, cid: str):
                 reset_chain(f"{label} cancelled: WIN via /peek [chain={cid}]")
                 return
             gap = ML1_GAP_S if ml_label == 1 else ML2_GAP_S
-            if gap > 0:
+            if gap > 0 and ml_label < 2:
                 await asyncio.sleep(gap)
-            amt = min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
-            await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=ml_label)
-            return
+            if ml_label < 2:  # Only fire next if not ML2
+                amt = min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
+                await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=ml_label)
+                return
+            else:
+                reset_chain(f"{label} LOSS confirmed [chain={cid}]")
+                return
         await asyncio.sleep(POLL_INTERVAL_S)
 
-    reset_chain(f"{label} aborted: no posted result within {POLL_WINDOW_S}s [chain={cid}]")
+    # Failsafe reset — no result found within poll window
+    if ml_label == 2:
+        reset_chain(f"{label} assumed LOSS (no result) [chain={cid}]")
+    else:
+        reset_chain(f"{label} aborted: no posted result within {POLL_WINDOW_S}s [chain={cid}]")
 
 # ── Signal Handling ──────────────────────────────────────────────────────────
 async def handle_signal_from_text(text: str, msg_date=None):
