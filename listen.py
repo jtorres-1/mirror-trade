@@ -1,5 +1,5 @@
 # listen.py — Telegram -> PocketOption with martingale
-# Fix: Anchor entry_time to msg_date ET to resolve AM/PM and overnight sessions
+# Fix: Anchor entry_time to msg_date ET, prevent ERROR_NO_TRADE from triggering ML
 
 import os, re, csv, asyncio, sys, requests
 from datetime import datetime, timedelta, timezone
@@ -119,14 +119,11 @@ def resolve_entry_datetime(hhmm: str, msg_date_utc: datetime) -> datetime:
     msg_et = msg_date_utc + timedelta(minutes=tz_offset_minutes)
     candidate = msg_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
-    # If candidate is more than 6h before msg time, assume it's next day
     if (candidate - msg_et).total_seconds() < -6*3600:
         candidate += timedelta(days=1)
-    # If candidate is more than 18h ahead, roll back a day (mis-AM/PM)
     elif (candidate - msg_et).total_seconds() > 18*3600:
         candidate -= timedelta(days=1)
 
-    # Convert back to UTC
     return candidate - timedelta(minutes=tz_offset_minutes)
 
 def et_day_key() -> str:
@@ -150,12 +147,12 @@ async def sleep_until(when: datetime):
     await asyncio.sleep(delay)
 
 # --- Run one trade ---
-async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> bool:
+async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> str:
     global executor_busy, daily_pnl, halted_for_day
 
     if executor_busy:
         print("[BLOCK] Executor busy, skipping duplicate call.")
-        return False
+        return "SKIPPED"
     executor_busy = True
 
     clean_pair = pair
@@ -163,7 +160,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> b
         clean_pair = f"{clean_pair} OTC"
 
     ml_tag = f"ML{ml_label}" if ml_label else "BASE"
-    success, result, profit = False, "ERROR", 0.0
+    result, profit = "ERROR", 0.0
 
     try:
         res = requests.post(
@@ -175,12 +172,19 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> b
             data = res.json()
             result = data.get("result", "LOSS")
             profit = float(data.get("profit", 0))
-            if profit <= 0: result = "LOSS"
-            success = (result == "WIN")
+
+            if result == "ERROR_NO_TRADE":
+                result = "ERROR_NO_TRADE"
+            elif profit > 0:
+                result = "WIN"
+            else:
+                result = "LOSS"
         else:
             print(f"[API ERROR] {res.status_code}: {res.text}")
+            result = "ERROR"
     except Exception as e:
         print(f"[API EXCEPTION] {e}")
+        result = "ERROR"
     finally:
         executor_busy = False
 
@@ -191,7 +195,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> b
         print(f"[HALT] Daily stop-loss reached. PnL={daily_pnl:.2f}, halting new trades.")
 
     print(f"[API] Trade done: {direction} {clean_pair} ${amount} → {result} ({profit}) [{ml_tag}]")
-    return success
+    return result
 
 # --- ML scheduling ---
 async def schedule_entry(entry_dt: datetime, ml_label=None):
@@ -208,9 +212,9 @@ async def schedule_entry(entry_dt: datetime, ml_label=None):
     label_str = f"ML{ml_label}" if ml_label else "BASE"
     print(f"[EXECUTE] {pair} {direction} {expiry}m amount {amt} ({label_str}) @ {datetime.utcnow()}")
 
-    won = await run_one_trade(pair, direction, expiry, amt, ml_label=ml_label)
+    result = await run_one_trade(pair, direction, expiry, amt, ml_label=ml_label)
 
-    if won:
+    if result == "WIN":
         print("[ML] WIN → reset to base")
         for t in scheduled_tasks:
             if not t.done(): t.cancel()
@@ -219,6 +223,13 @@ async def schedule_entry(entry_dt: datetime, ml_label=None):
                         "ml_levels": [],"ml_i": 0,"amount": base_amount})
         return
 
+    if result in ("ERROR", "ERROR_NO_TRADE"):
+        print("[ML] ERROR/No Trade → reset, no martingale")
+        current.update({"active": False,"pair": None,"direction": None,
+                        "ml_levels": [],"ml_i": 0,"amount": base_amount})
+        return
+
+    # Only continue ML if true LOSS
     if current["ml_i"] < len(current["ml_levels"]):
         next_t = current["ml_levels"][current["ml_i"]]
         current["ml_i"] += 1
