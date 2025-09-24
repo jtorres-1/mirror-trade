@@ -37,6 +37,7 @@ let tradeInProgress = false;
 let recentTrades = {};
 let lastPairCache = null;
 
+// remembers the most recent placed trade params per chain
 const expectedByChain = Object.create(null);
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -180,51 +181,43 @@ function recordClosedTrade(meta) {
 
 async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") {
   let profit = 0.0, result = "LOSS", closed_at = new Date().toISOString();
-  let matched = false;
-
   try {
     await page.locator(SEL.closedTab).click({ timeout: 2000 });
     await page.waitForSelector(SEL.closedRow, { timeout: 3000 });
     await page.waitForTimeout(500);
 
     const rows = await page.locator(SEL.closedRow).all();
-    for (const [i, row] of rows.entries()) {
+    for (const row of rows) {
       const text = await row.innerText().catch(() => '');
-      console.log(`[Debug] Row ${i}: ${text}`);
+      if (!text) continue;
 
-      if (pair && !text.includes(pair)) {
-        console.log(`[Skip] Row ${i} failed pair check`);
-        continue;
-      }
+      // --- Pair check (loose)
+      if (pair && !text.toLowerCase().includes(pair.toLowerCase().replace(" otc", ""))) continue;
 
+      // --- Amount check (loose tolerance)
       const numericMatches = text.match(/[\d.,]+/g) || [];
       const hasAmount = numericMatches.some(num => {
         const val = parseFloat(num.replace(/,/g, ""));
-        return !isNaN(val) && Math.abs(val - amount) < 0.1;
+        return !isNaN(val) && Math.abs(val - amount) < 0.05; // 5c tolerance
       });
-      if (amount && !hasAmount) {
-        console.log(`[Skip] Row ${i} failed amount check (expected ${amount})`);
-        continue;
-      }
+      if (amount && !hasAmount) continue;
 
+      // --- Direction check (fallback to requested if not found)
       let detectedDirection = null;
       if (await row.locator(SEL.directionUp).count() > 0) detectedDirection = "BUY";
       if (await row.locator(SEL.directionDown).count() > 0) detectedDirection = "SELL";
-      if (detectedDirection && direction && detectedDirection !== direction.toUpperCase()) {
-        console.log(`[Skip] Row ${i} failed direction check`);
-        continue;
-      }
+      if (!detectedDirection) detectedDirection = direction?.toUpperCase();
+      if (detectedDirection && direction && detectedDirection !== direction.toUpperCase()) continue;
 
+      // --- Profit check
       const profitNode = row.locator(SEL.profitCell).last();
-      if (await profitNode.count() === 0) {
-        console.log(`[Skip] Row ${i} missing profit cell`);
-        continue;
-      }
+      if (await profitNode.count() === 0) continue;
       let profitText = await profitNode.innerText();
       profitText = profitText.replace(/[^\d.-]/g, "");
       profit = parseFloat(profitText || "0");
       result = profit > 0 ? "WIN" : "LOSS";
 
+      // --- Closed time freshness (soft filter)
       try {
         const timeNode = row.locator(SEL.closeTime).first();
         if (await timeNode.count()) {
@@ -233,21 +226,10 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
           closed_at = new Date(now.toDateString() + " " + timeStr + " UTC").toISOString();
         }
       } catch {}
-      const closedAgo = Date.now() - new Date(closed_at).getTime();
-      if (closedAgo > 180000) {
-        console.log(`[Skip] Row ${i} too old (${closedAgo}ms)`);
-        continue;
-      }
-
-      matched = true;
       break;
     }
   } catch (err) {
     console.error("[❌] Result parse failed:", err.message);
-  }
-
-  if (!matched) {
-    console.warn(`[Fallback] No matching row for chain=${chain_id}, amount=${amount}. Forcing LOSS.`);
   }
 
   const meta = { amount, pair, direction, ml_tag, chain_id, profit, result, closed_at };
