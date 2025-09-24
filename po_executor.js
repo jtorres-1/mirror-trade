@@ -1,5 +1,6 @@
 // po_executor.js — Executor with robust Closed tab scraping for /peek
 // Hardened against stale results, formatting mismatches, and cross-chain contamination.
+// FIXED: expectedByChain now tracks multiple trades per chain (ML1/ML2 no longer overwrite)
 
 const path = require("path");
 const express = require("express");
@@ -37,7 +38,7 @@ let tradeInProgress = false;
 let recentTrades = {};
 let lastPairCache = null;
 
-// remembers the most recent placed trade params per chain
+// FIX: expectedByChain now stores an array (queue) of expected trades per chain
 const expectedByChain = Object.create(null);
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -179,7 +180,8 @@ function recordClosedTrade(meta) {
   if (recentTrades[chain_id].length > 5) recentTrades[chain_id].pop();
 }
 
-async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") {
+async function parseClosedTrade(expected, chain_id = "") {
+  const { amount, pair, direction, ml_tag } = expected;
   let profit = 0.0, result = "LOSS", closed_at = new Date().toISOString();
   try {
     await page.locator(SEL.closedTab).click({ timeout: 2000 });
@@ -191,25 +193,21 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
       const text = await row.innerText().catch(() => '');
       if (!text) continue;
 
-      // --- Pair check (loose)
       if (pair && !text.toLowerCase().includes(pair.toLowerCase().replace(" otc", ""))) continue;
 
-      // --- Amount check (loose tolerance)
       const numericMatches = text.match(/[\d.,]+/g) || [];
       const hasAmount = numericMatches.some(num => {
         const val = parseFloat(num.replace(/,/g, ""));
-        return !isNaN(val) && Math.abs(val - amount) < 0.05; // 5c tolerance
+        return !isNaN(val) && Math.abs(val - amount) < 0.05;
       });
       if (amount && !hasAmount) continue;
 
-      // --- Direction check (fallback to requested if not found)
       let detectedDirection = null;
       if (await row.locator(SEL.directionUp).count() > 0) detectedDirection = "BUY";
       if (await row.locator(SEL.directionDown).count() > 0) detectedDirection = "SELL";
       if (!detectedDirection) detectedDirection = direction?.toUpperCase();
       if (detectedDirection && direction && detectedDirection !== direction.toUpperCase()) continue;
 
-      // --- Profit check
       const profitNode = row.locator(SEL.profitCell).last();
       if (await profitNode.count() === 0) continue;
       let profitText = await profitNode.innerText();
@@ -217,7 +215,6 @@ async function parseClosedTrade(amount, pair, direction, ml_tag, chain_id = "") 
       profit = parseFloat(profitText || "0");
       result = profit > 0 ? "WIN" : "LOSS";
 
-      // --- Closed time freshness (soft filter)
       try {
         const timeNode = row.locator(SEL.closeTime).first();
         if (await timeNode.count()) {
@@ -271,7 +268,8 @@ async function placeTrade(pair, amount, direction, ml_tag = "", chain_id = "", e
     });
 
     if (chain_id) {
-      expectedByChain[chain_id] = { amount, pair, direction, ml_tag, ts: Date.now() };
+      if (!expectedByChain[chain_id]) expectedByChain[chain_id] = [];
+      expectedByChain[chain_id].push({ amount, pair, direction, ml_tag, ts: Date.now() });
     }
 
     const ts = new Date().toISOString();
@@ -288,11 +286,13 @@ async function peekLatestProfit(chain_id = null) {
   try { await page.locator(SEL.closedTab).click({ timeout: 3000 }); } catch {}
 
   if (!chain_id) return null;
-  const expected = expectedByChain[chain_id];
+  const queue = expectedByChain[chain_id];
+  if (!queue || queue.length === 0) return null;
+
+  const expected = queue.shift(); // pop oldest expected trade
   if (!expected) return null;
 
-  const { amount, pair, direction, ml_tag } = expected;
-  const meta = await parseClosedTrade(amount, pair, direction, ml_tag, chain_id);
+  const meta = await parseClosedTrade(expected, chain_id);
   return meta || null;
 }
 
