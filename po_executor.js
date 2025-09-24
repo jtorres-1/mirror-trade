@@ -1,12 +1,11 @@
 // po_executor.js — Hardened executor
-// Fix: Scoped selectors, single-click guard, pair-switch delay, ML tag logging
+// Fix: Scoped selectors, single-click guard, pair-switch delay, ML tag logging + Overlay force-close
 
 const path = require("path");
 const express = require("express");
 const { chromium } = require("playwright");
 const fs = require("fs");
 require("dotenv").config();
-
 
 const PO_URL_TRADE = "https://pocketoption.com/en/cabinet/";
 const HEADLESS = process.env.HEADLESS === "1";
@@ -122,10 +121,14 @@ async function selectPair(pair) {
     return;
   }
 
+  await forceCloseOverlays();
+
   await withRetry(async () => {
     await toggle.click({ timeout: DEFAULT_TIMEOUT });
     await page.waitForSelector(SEL.assetOverlay, { state: 'visible', timeout: DEFAULT_TIMEOUT });
   }, 2, "open asset overlay");
+
+  await forceCloseOverlays();
 
   const cleaned = pair.replace(" OTC", "").replace("/", "").toLowerCase();
   const search = page.locator(SEL.searchInput).first();
@@ -162,7 +165,13 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   await ensurePageAlive();
   await ensureOnPO();
 
-  await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
+  try {
+    await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
+  } catch (err) {
+    console.error("[❌] Pair selection failed due to overlay:", err);
+    tradeInProgress = false;
+    return { success: false, result: "ERROR_NO_TRADE", profit: 0, ml_tag };
+  }
 
   console.log("[Step] Setting amount…");
   await withRetry(async () => { await setTradeAmount(amount); }, 2, "setTradeAmount");
@@ -183,7 +192,7 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   } catch (err) {
     console.error("[❌] Trade button click failed:", err);
     tradeInProgress = false;
-    throw err;
+    return { success: false, result: "ERROR_NO_TRADE", profit: 0, ml_tag };
   }
 
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
@@ -191,11 +200,15 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   await sleep(305000);
 
   await page.locator(SEL.closedTab).click({ timeout: 5000 }).catch(() => {
-    throw new Error("Failed to click Closed tab");
+    console.error("[❌] Failed to click Closed tab");
+    return { success: false, result: "ERROR_NO_TRADE", profit: 0, ml_tag };
   });
 
   const row = page.locator(SEL.closedRow).first();
-  await row.waitFor({ state: "visible", timeout: 10000 });
+  await row.waitFor({ state: "visible", timeout: 10000 }).catch(() => {
+    console.error("[❌] Closed row not visible");
+    return { success: false, result: "ERROR_NO_TRADE", profit: 0, ml_tag };
+  });
 
   const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
   console.log(`[Debug] Closed row text: ${rowText}`);
