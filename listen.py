@@ -187,24 +187,31 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> N
         log_trade(clean_pair, direction, expiry_min, amount, "OPEN", 0.0, ml_tag, chain_id)
         print(f"[API] Fired: {direction} {clean_pair} ${amount} [{ml_tag}] [chain={chain_id}]")
 
-        # Anchor next decision via hybrid wait (sleep then short poll)
+        # Schedule the correct waiter for the outcome we're about to need.
         if ml_label is None:
+            # Base fired → wait for BASE result (ML1 waiter)
             cancel_task(ml1_task)
             ml1_task = asyncio.create_task(wait_outcome_then_decide(expiry_min, 1, chain_id))
         elif ml_label == 1:
+            # ML1 fired → wait for ML1 result (ML2 waiter)
             cancel_task(ml2_task)
             ml2_task = asyncio.create_task(wait_outcome_then_decide(expiry_min, 2, chain_id))
+        # ml_label == 2 → final level; we will wait for its result inside the ML2 waiter itself
     finally:
         executor_busy = False
 
 # ── Outcome-anchored hybrid wait ─────────────────────────────────────────────
 async def wait_outcome_then_decide(expiry_min: int, ml_label: int, cid: str):
+    """
+    ml_label=1: monitors BASE result, fires ML1 on loss.
+    ml_label=2: monitors ML1 result; on loss, fires ML2 and then waits & parses ML2 result; finally resets.
+    """
     label = f"ML{ml_label}"
     full_sleep = max(0.0, expiry_min * 60.0)
     print(f"[WAIT] {label}: sleeping {full_sleep:.2f}s for expiry [chain={cid}]")
     await asyncio.sleep(full_sleep)
 
-    # short, tight poll window
+    # First poll for the result of the level we were waiting on (BASE if ml_label=1, ML1 if ml_label=2)
     start = datetime.utcnow()
     while (datetime.utcnow() - start).total_seconds() < POLL_WINDOW_S:
         ok, profit, _tag, peek_chain = quick_peek(cid)
@@ -213,25 +220,47 @@ async def wait_outcome_then_decide(expiry_min: int, ml_label: int, cid: str):
                 reset_chain(f"{label} cancelled: WIN via /peek [chain={cid}]")
                 return
 
-            # Loss case
-            gap = ML1_GAP_S if ml_label == 1 else ML2_GAP_S
-            if gap > 0:
-                await asyncio.sleep(gap)
-
-            if ml_label == 1:  # ML1 lost → fire ML2
-                amt = min(round(base_amount * (mg_mult ** ml_label), 2), MAX_STAKE)
-                await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=2)
+            # LOSS at the monitored level:
+            if ml_label == 1:
+                # BASE lost → fire ML1
+                if ML1_GAP_S > 0:
+                    await asyncio.sleep(ML1_GAP_S)
+                amt_ml1 = min(round(base_amount * (mg_mult ** 1), 2), MAX_STAKE)
+                print(f"[NEXT] Firing ML1 amount={amt_ml1} [chain={cid}]")
+                await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt_ml1, ml_label=1)
                 return
 
-            if ml_label == 2:  # ML2 lost → reset
-                reset_chain(f"{label} LOSS confirmed [chain={cid}]")
-                return
+            if ml_label == 2:
+                # ML1 lost → fire ML2, then wait for ML2 result here
+                if ML2_GAP_S > 0:
+                    await asyncio.sleep(ML2_GAP_S)
+                amt_ml2 = min(round(base_amount * (mg_mult ** 2), 2), MAX_STAKE)
+                print(f"[NEXT] Firing ML2 amount={amt_ml2} [chain={cid}]")
+                await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt_ml2, ml_label=2)
 
+                # Now wait ML2 expiry, then poll for ML2 result and reset
+                wait_ml2 = max(0.0, expiry_min * 60.0)
+                print(f"[WAIT-ML2-RESULT] Sleeping {wait_ml2:.2f}s [chain={cid}]")
+                await asyncio.sleep(wait_ml2)
+
+                start2 = datetime.utcnow()
+                while (datetime.utcnow() - start2).total_seconds() < POLL_WINDOW_S:
+                    ok2, profit2, _tag2, peek_chain2 = quick_peek(cid)
+                    if ok2 and peek_chain2 == cid:
+                        if profit2 > 0:
+                            reset_chain(f"ML2 WIN via /peek [chain={cid}]")
+                        else:
+                            reset_chain(f"ML2 LOSS confirmed [chain={cid}]")
+                        return
+                    await asyncio.sleep(POLL_INTERVAL_S)
+
+                reset_chain(f"ML2 assumed LOSS (no result) [chain={cid}]")
+                return
         await asyncio.sleep(POLL_INTERVAL_S)
 
-    # Failsafe reset if nothing matched
+    # If we never saw the expected result for the monitored level
     if ml_label == 2:
-        reset_chain(f"{label} assumed LOSS (no result) [chain={cid}]")
+        reset_chain(f"{label} aborted: no ML1 result within {POLL_WINDOW_S}s [chain={cid}]")
     else:
         reset_chain(f"{label} aborted: no posted result within {POLL_WINDOW_S}s [chain={cid}]")
 
