@@ -3,7 +3,7 @@
 
 const path = require("path");
 const express = require("express");
-const { chromium } from require("playwright");
+const { chromium } = require("playwright");
 const fs = require("fs");
 require("dotenv").config();
 
