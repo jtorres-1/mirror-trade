@@ -1,5 +1,5 @@
 # listen.py — Telegram -> PocketOption with martingale
-# Fix: Sequential ML controller — no pre-scheduling, next ML only after result
+# Fix: Dynamic ML controller — ML1/ML2 spawn after result (+2.5s), no pre-scheduling
 # Cancel shield included
 
 import os, re, csv, asyncio, sys, requests
@@ -75,7 +75,7 @@ def parse_signal(text: str) -> Optional[Dict]:
     norm = normalize_signal_text(text)
     if looks_like_summary(norm):
         return None
-    d = {"pair": None, "direction": None, "expiry_min": None, "entry_time": None, "ml_levels": []}
+    d = {"pair": None, "direction": None, "expiry_min": None, "entry_time": None}
 
     m_pair = PAIR_RE.search(norm.upper())
     if m_pair:
@@ -99,12 +99,6 @@ def parse_signal(text: str) -> Optional[Dict]:
             m = TIME_RE.search(ln)
             if m:
                 d["entry_time"] = m.group(1)
-
-        if "LEVEL" in up:
-            times = TIME_RE.findall(ln)
-            for t in times:
-                if t != d["entry_time"]:
-                    d["ml_levels"].append(t)
 
     if d["expiry_min"] is None:
         d["expiry_min"] = 5
@@ -132,8 +126,7 @@ def et_day_key() -> str:
     return now_et.strftime("%Y-%m-%d")
 
 # --- Trade state ---
-current = {"active": False,"pair": None,"direction": None,"expiry_min": 5,
-           "ml_levels": [],"ml_i": 0,"amount": base_amount}
+current = {"active": False,"pair": None,"direction": None,"expiry_min": 5,"amount": base_amount}
 last_signal_utc: Optional[datetime] = None
 seen_ids = set()
 
@@ -145,6 +138,9 @@ chain_active = True
 async def sleep_until(when: datetime):
     delay = max(0, (when - datetime.utcnow()).total_seconds())
     await asyncio.sleep(delay)
+
+async def safe_sleep(seconds: float):
+    await asyncio.sleep(seconds)
 
 # --- Run one trade ---
 async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> bool:
@@ -196,41 +192,41 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None) -> b
     if success:
         print("[CANCEL] WIN detected — chain ends here.")
         chain_active = False
-        current.update({"active": False,"pair": None,"direction": None,
-                        "ml_levels": [],"ml_i": 0,"amount": base_amount})
+        current.update({"active": False,"pair": None,"direction": None,"expiry_min": 5,"amount": base_amount})
     return success
 
-# --- Sequential ML controller ---
+# --- Dynamic ML controller ---
 async def run_chain(entry_dt: datetime):
     global current, chain_active
 
+    # BASE
     await sleep_until(entry_dt)
     amt = min(current["amount"], MAX_STAKE)
     print(f"[EXECUTE] BASE {current['pair']} {current['direction']} {amt}")
     win = await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=None)
     if win: return
 
-    # Sequential ML loop
-    while chain_active and current["ml_i"] < len(current["ml_levels"]):
-        current["ml_i"] += 1
-        if current["ml_i"] >= 3:
-            print("[ML] ML3 disabled; stopping at ML2.")
-            break
-
-        next_t = current["ml_levels"][current["ml_i"] - 1]
+    # ML1 (2.5s after base loss)
+    if chain_active:
+        await safe_sleep(2.5)
         amt = round(min(current["amount"] * mg_mult, MAX_STAKE), 2)
         current["amount"] = amt
+        print(f"[EXECUTE] ML1 {current['pair']} {current['direction']} {amt}")
+        win = await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=1)
+        if win: return
 
-        next_dt = resolve_entry_datetime(next_t, datetime.utcnow())
-        print(f"[EXECUTE] ML{current['ml_i']} {current['pair']} {current['direction']} {amt} at {next_dt}")
-        await sleep_until(next_dt)
+    # ML2 (2.5s after ML1 loss)
+    if chain_active:
+        await safe_sleep(2.5)
+        amt = round(min(current["amount"] * mg_mult, MAX_STAKE), 2)
+        current["amount"] = amt
+        print(f"[EXECUTE] ML2 {current['pair']} {current['direction']} {amt}")
+        win = await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=2)
+        if win: return
 
-        win = await run_one_trade(current["pair"], current["direction"], current["expiry_min"], amt, ml_label=current["ml_i"])
-        if win: break
-
+    # Reset after ML2 loss
     chain_active = False
-    current.update({"active": False,"pair": None,"direction": None,
-                    "ml_levels": [],"ml_i": 0,"amount": base_amount})
+    current.update({"active": False,"pair": None,"direction": None,"expiry_min": 5,"amount": base_amount})
 
 # --- Telegram handlers ---
 async def handle_signal_from_text(text: str, msg_date=None):
@@ -267,10 +263,9 @@ async def handle_signal_from_text(text: str, msg_date=None):
 
     chain_active = True
     current.update({"active": True,"pair": sig["pair"],"direction": sig["direction"],
-                    "expiry_min": sig["expiry_min"],"ml_levels": sig.get("ml_levels", []),
-                    "ml_i": 0,"amount": base_amount})
+                    "expiry_min": sig["expiry_min"],"amount": base_amount})
     last_signal_utc = now_utc
-    print(f"[SIGNAL] {sig['pair']} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} | ML {sig.get('ml_levels', [])}")
+    print(f"[SIGNAL] {sig['pair']} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']}")
     asyncio.create_task(run_chain(entry_dt))
     return True
 
