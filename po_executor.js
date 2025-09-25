@@ -1,4 +1,4 @@
-// po_executor.js — Executor with overlay insurance (patched selectPair)
+// po_executor.js — Executor with overlay insurance (patched selectPair, 300s wait)
 
 const path = require("path");
 const express = require("express");
@@ -195,7 +195,8 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
 
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
 
-  await sleep(305000);
+  // shortened wait from 305s → 300s
+  await sleep(300000);
 
   await forceCloseOverlays();
   await page.locator(SEL.closedTab).click({ timeout: 5000 }).catch(() => {
