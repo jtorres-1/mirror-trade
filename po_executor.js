@@ -1,5 +1,5 @@
-// po_executor.js — Hardened executor
-// Fix: Scoped selectors, single-click guard, pair-switch delay, ML tag logging, overlay force-close (no retry hang)
+// po_executor.js — Executor with overlay insurance
+// Fix: Force-close overlays on every step to prevent timeouts
 
 const path = require("path");
 const express = require("express");
@@ -41,6 +41,7 @@ async function withRetry(fn, attempts = 2, label = "op") {
       lastErr = err;
       console.warn(`[Retry] ${label} failed (${i + 1}/${attempts}) -> ${err?.message}`);
       await sleep(300);
+      await forceCloseOverlays();
     }
   }
   throw lastErr;
@@ -61,7 +62,7 @@ async function waitForTradePanel() {
 
 async function forceCloseOverlays() {
   for (let i = 0; i < 3; i++) {
-    try { await page.keyboard.press("Escape"); } catch {}
+    try { await page.keyboard.press('Escape'); } catch {}
     const overlay = page.locator(SEL.assetOverlay).first();
     const visible = await overlay.isVisible().catch(() => false);
     if (!visible) break;
@@ -70,6 +71,7 @@ async function forceCloseOverlays() {
   }
 }
 
+// ----------------------------- Page Health ----------------------------------
 async function ensureOnPO() {
   if (!page || page.isClosed()) throw new Error("No page");
   const url = page.url() || "";
@@ -81,6 +83,7 @@ async function ensureOnPO() {
     console.log("[📸] Screenshot after navigation saved:", file);
   }
   await withRetry(async () => { await waitForTradePanel(); }, 2, "wait trade panel");
+  await forceCloseOverlays();
 }
 
 async function ensurePageAlive() {
@@ -95,25 +98,27 @@ async function ensurePageAlive() {
     await page.reload({ waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT }).catch(() => {});
     await ensureOnPO();
   }
+  await forceCloseOverlays();
 }
 
+// ----------------------------- Trade Steps ----------------------------------
 async function setTradeAmount(amount) {
+  await forceCloseOverlays();
   const panel = page.locator(SEL.tradePanel).first();
-  const amountBox = panel.getByRole("textbox").first();
-  await amountBox.waitFor({ state: "attached", timeout: DEFAULT_TIMEOUT }).catch(() => {});
+  const amountBox = panel.getByRole('textbox').first();
+  await amountBox.waitFor({ state: 'attached', timeout: DEFAULT_TIMEOUT }).catch(() => {});
   try {
     await amountBox.fill(String(amount), { force: true, timeout: 1500 });
     return;
   } catch {}
   await panel.click({ force: true }).catch(() => {});
-  await page.keyboard.press("Control+A").catch(() => {});
-  await page.keyboard.press("Backspace").catch(() => {});
+  await page.keyboard.press('Control+A').catch(() => {});
+  await page.keyboard.press('Backspace').catch(() => {});
   await page.keyboard.type(String(amount)).catch(() => {});
 }
 
 async function selectPair(pair) {
   const toggle = page.locator(SEL.symbolToggle).first();
-
   let current = "";
   try { current = (await toggle.textContent({ timeout: 800 })) || ""; } catch {}
   if (current && current.toLowerCase().includes(pair.toLowerCase().replace(" otc", ""))) {
@@ -122,44 +127,29 @@ async function selectPair(pair) {
     return;
   }
 
-  // Step 1: Force close overlays
   await forceCloseOverlays();
 
-  // Step 2: Open selector
-  await toggle.click({ timeout: DEFAULT_TIMEOUT }).catch(() => {});
-  await page.waitForSelector(SEL.assetOverlay, { state: "visible", timeout: 3000 }).catch(() => {});
+  await withRetry(async () => {
+    await toggle.click({ timeout: DEFAULT_TIMEOUT });
+    await page.waitForSelector(SEL.assetOverlay, { state: 'visible', timeout: DEFAULT_TIMEOUT });
+  }, 2, "open asset overlay");
 
-  // Step 3: Ensure input clear
   await forceCloseOverlays();
 
   const cleaned = pair.replace(" OTC", "").replace("/", "").toLowerCase();
   const search = page.locator(SEL.searchInput).first();
-
-  // Step 4: Attempt search once, escape fallback
-  try {
-    await search.fill(cleaned, { timeout: 1500 });
-  } catch {
-    console.warn("[ForceClose] Search blocked. Retrying after Escape…");
-    await forceCloseOverlays();
-    await toggle.click({ timeout: DEFAULT_TIMEOUT }).catch(() => {});
-    await page.waitForSelector(SEL.assetOverlay, { state: "visible", timeout: 3000 }).catch(() => {});
-    await search.fill(cleaned, { timeout: 1500 }).catch(() => {});
-  }
-
+  await withRetry(async () => { await search.fill(cleaned); }, 2, "search fill");
   await sleep(250);
 
-  // Step 5: Select pair
-  const listItem = page.locator(".alist__label", { hasText: pair }).first();
-  await listItem.click({ timeout: DEFAULT_TIMEOUT }).catch(err => {
-    throw new Error(`Pair not found in list: ${pair}`);
-  });
+  const listItem = page.locator('.alist__label', { hasText: pair }).first();
+  await withRetry(async () => { await listItem.click({ timeout: DEFAULT_TIMEOUT }); }, 2, "select list item");
 
   console.log(`[Step] Selected pair: ${pair}`);
-  await page.keyboard.press("Escape").catch(() => {});
   await forceCloseOverlays();
-  await sleep(800);
+  await sleep(1000);
 }
 
+// ----------------------------- Logging --------------------------------------
 function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "") {
   const header = "Time,Pair,Dir,Amount,Result,Profit,ML_Tag\n";
   if (!fs.existsSync(LOG_FILE)) {
@@ -168,6 +158,7 @@ function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "") {
   fs.appendFileSync(LOG_FILE, `${ts},${pair},${dir},${amount},${result},${profit},${ml_tag}\n`);
 }
 
+// ----------------------------- Trade Core -----------------------------------
 async function placeTrade(pair, amount, direction, ml_tag = "") {
   if (tradeInProgress) {
     console.warn("[Guard] Trade already in progress. Skipping duplicate request.");
@@ -179,7 +170,7 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   await ensurePageAlive();
   await ensureOnPO();
 
-  await selectPair(pair);
+  await withRetry(async () => { await selectPair(pair); }, 2, "selectPair");
 
   console.log("[Step] Setting amount…");
   await withRetry(async () => { await setTradeAmount(amount); }, 2, "setTradeAmount");
@@ -187,11 +178,12 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   console.log("[Step] Expiry locked at 5m (no action needed)");
 
   const panel = page.locator(SEL.tradePanel).first();
-  const btn = direction.toLowerCase() === "buy"
+  const btn = direction.toLowerCase() === 'buy'
     ? panel.locator(SEL.buyBtn).first()
     : panel.locator(SEL.sellBtn).first();
 
-  await btn.waitFor({ state: "visible", timeout: DEFAULT_TIMEOUT });
+  await btn.waitFor({ state: 'visible', timeout: DEFAULT_TIMEOUT });
+  await forceCloseOverlays();
 
   console.log(`[CLICK] ${direction.toUpperCase()} button for ${pair} @ $${amount}`);
 
@@ -207,6 +199,7 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
 
   await sleep(305000);
 
+  await forceCloseOverlays();
   await page.locator(SEL.closedTab).click({ timeout: 5000 }).catch(() => {
     throw new Error("Failed to click Closed tab");
   });
@@ -248,6 +241,8 @@ async function initBrowser() {
 
   await page.goto(PO_URL_TRADE, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
   await ensureOnPO();
+  await forceCloseOverlays();
+
   const file = path.join(SCREEN_DIR, `init_ready_${Date.now()}.png`);
   await page.screenshot({ path: file }).catch(() => {});
   console.log("[📸] Screenshot after init saved:", file);
