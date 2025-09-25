@@ -1,5 +1,4 @@
-// po_executor.js — Executor with overlay insurance
-// Fix: Force-close overlays on every step to prevent timeouts
+// po_executor.js — Executor with overlay insurance (patched selectPair)
 
 const path = require("path");
 const express = require("express");
@@ -19,7 +18,7 @@ const SEL = {
   symbolToggle: 'span.current-symbol.current-symbol_cropped, .current-symbol',
   assetOverlay: '.drop-down-modal-wrap.active',
   tradePanel: '[id^="put-call-buttons-chart"]',
-  searchInput: 'input[placeholder="Search"]',
+  searchInput: 'input[placeholder="Search"], input.alist__search, input[placeholder*="asset"]',
 
   buyBtn: '#put-call-buttons-chart-1 a.buy, #put-call-buttons-chart-1 button:has-text("Buy"), a.btn.btn-call',
   sellBtn: '#put-call-buttons-chart-1 a.sell, #put-call-buttons-chart-1 button:has-text("Sell"), a.btn.btn-put',
@@ -127,15 +126,13 @@ async function selectPair(pair) {
     return;
   }
 
-  await forceCloseOverlays();
-
+  // open overlay
   await withRetry(async () => {
     await toggle.click({ timeout: DEFAULT_TIMEOUT });
     await page.waitForSelector(SEL.assetOverlay, { state: 'visible', timeout: DEFAULT_TIMEOUT });
   }, 2, "open asset overlay");
 
-  await forceCloseOverlays();
-
+  // keep overlay open → search works
   const cleaned = pair.replace(" OTC", "").replace("/", "").toLowerCase();
   const search = page.locator(SEL.searchInput).first();
   await withRetry(async () => { await search.fill(cleaned); }, 2, "search fill");
@@ -145,6 +142,7 @@ async function selectPair(pair) {
   await withRetry(async () => { await listItem.click({ timeout: DEFAULT_TIMEOUT }); }, 2, "select list item");
 
   console.log(`[Step] Selected pair: ${pair}`);
+  // now close overlays after pair is chosen
   await forceCloseOverlays();
   await sleep(1000);
 }
