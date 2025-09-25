@@ -1,5 +1,6 @@
 # listen.py — Telegram -> PocketOption with martingale
 # Fix: Anchor entry_time to msg_date ET, prevent ERROR_NO_TRADE from triggering ML
+# Patch: Add SKEW_MS, ML1_GAP_S, ML2_GAP_S offsets from .env
 
 import os, re, csv, asyncio, sys, requests
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,11 @@ base_amount = float(os.getenv("TRADE_AMOUNT", "1"))
 mg_mult = float(os.getenv("MARTINGALE_MULT", "2.2"))
 MAX_STAKE = float(os.getenv("MAX_STAKE", "10.65"))
 DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "0"))
+
+# New timing envs
+SKEW_MS = int(os.getenv("SKEW_MS", "0"))
+ML1_GAP_S = float(os.getenv("ML1_GAP_S", "3"))
+ML2_GAP_S = float(os.getenv("ML2_GAP_S", "3"))
 
 if not api_id or not api_hash:
     print("[FATAL] API_ID/API_HASH missing in .env")
@@ -203,6 +209,14 @@ async def schedule_entry(entry_dt: datetime, ml_label=None):
     if DAILY_STOP_LOSS > 0 and halted_for_day:
         print("[HALT] Daily stop-loss reached; skip scheduled entry.")
         return
+
+    # Apply skew/gaps
+    if ml_label is None:  # Base
+        entry_dt -= timedelta(milliseconds=SKEW_MS)
+    elif ml_label == 1:
+        entry_dt += timedelta(seconds=ML1_GAP_S)
+    elif ml_label == 2:
+        entry_dt += timedelta(seconds=ML2_GAP_S)
 
     print(f"[TIME] Target {entry_dt} (UTC)  now {datetime.utcnow()}")
     await sleep_until(entry_dt)
