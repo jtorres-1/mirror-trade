@@ -206,11 +206,12 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
   console.log(`[Debug] Closed row text: ${rowText}`);
 
-  // extract close time
+  // extract close time (regex-safe)
   let close_time = "";
   try {
-    close_time = await row.locator("div.item-row + div").first().innerText();
-    close_time = close_time.trim();
+    const firstRowText = await row.locator("div.item-row").first().innerText();
+    const match = firstRowText.match(/\d{1,2}:\d{2}/);
+    if (match) close_time = match[0];
   } catch {
     close_time = "";
   }
