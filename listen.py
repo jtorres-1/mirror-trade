@@ -2,7 +2,7 @@
 # Fix: Anchor entry_time to msg_date ET, prevent ERROR_NO_TRADE from triggering ML
 # Patch: Add SKEW_MS, ML1_GAP_S, ML2_GAP_S offsets from .env
 # Patch: Add chain_id tracking to isolate each trade chain, reset cleanly on win or full loss
-# Patch: Validate close_time from executor against expected expiry
+# Patch: Validate close_time from executor against expected expiry (anchored to entry_dt)
 
 import os, re, csv, asyncio, sys, requests, uuid
 from datetime import datetime, timedelta, timezone
@@ -21,7 +21,7 @@ phone = os.getenv("PHONE_NUMBER")
 session_name = os.getenv("SESSION_NAME", "mirrortrade")
 channel = os.getenv("CHANNEL")
 
-tz_offset_minutes = -int(os.getenv("TZ_OFFSET_MIN", "240"))  # ET offset vs UTC (LA uses 240)
+tz_offset_minutes = -int(os.getenv("TZ_OFFSET_MIN", "240"))  # ET offset vs UTC
 FORCE_OTC = os.getenv("FORCE_OTC", "1") == "1"
 base_amount = float(os.getenv("TRADE_AMOUNT", "1"))
 mg_mult = float(os.getenv("MARTINGALE_MULT", "2.2"))
@@ -153,7 +153,8 @@ def is_close_time_valid(expected_dt: datetime, reported_str: str) -> bool:
 
 # --- Trade state ---
 current = {"active": False,"pair": None,"direction": None,"expiry_min": 5,
-           "ml_levels": [],"ml_i": 0,"amount": base_amount,"chain_id": None}
+           "ml_levels": [],"ml_i": 0,"amount": base_amount,"chain_id": None,
+           "entry_dt": None}
 last_signal_utc: Optional[datetime] = None
 seen_ids = set()
 scheduled_tasks = []
@@ -174,10 +175,11 @@ def reset_chain():
             t.cancel()
     scheduled_tasks.clear()
     current.update({"active": False,"pair": None,"direction": None,
-                    "ml_levels": [],"ml_i": 0,"amount": base_amount,"chain_id": None})
+                    "ml_levels": [],"ml_i": 0,"amount": base_amount,
+                    "chain_id": None,"entry_dt": None})
 
 # --- Run one trade ---
-async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None, chain_id=None) -> str:
+async def run_one_trade(pair, direction, expiry_min, amount, entry_dt, ml_label=None, chain_id=None) -> str:
     global executor_busy, daily_pnl, halted_for_day
 
     if executor_busy:
@@ -205,7 +207,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None, chai
             profit = float(data.get("profit", 0))
             close_time = data.get("close_time", "")
 
-            expected_close_dt = datetime.utcnow() + timedelta(minutes=expiry_min)
+            expected_close_dt = entry_dt + timedelta(minutes=expiry_min)
             if close_time and not is_close_time_valid(expected_close_dt, close_time):
                 print(f"[WARN] Close time mismatch, ignoring row. expected≈{expected_close_dt.strftime('%H:%M')} got={close_time}")
                 result = "ERROR_NO_TRADE"
@@ -258,7 +260,7 @@ async def schedule_entry(entry_dt: datetime, ml_label=None):
     label_str = f"ML{ml_label}" if ml_label else "BASE"
     print(f"[EXECUTE] {pair} {direction} {expiry}m amount {amt} ({label_str}) (chain={chain_id}) @ {datetime.utcnow()}")
 
-    result = await run_one_trade(pair, direction, expiry, amt, ml_label=ml_label, chain_id=chain_id)
+    result = await run_one_trade(pair, direction, expiry, amt, entry_dt, ml_label=ml_label, chain_id=chain_id)
 
     # Reset logic tied to this chain only
     if result == "WIN":
@@ -332,7 +334,8 @@ async def handle_signal_from_text(text: str, msg_date=None):
         pair = f"{pair} OTC"
     current.update({"active": True,"pair": pair,"direction": sig["direction"],
                     "expiry_min": sig["expiry_min"],"ml_levels": sig.get("ml_levels", []),
-                    "ml_i": 0,"amount": base_amount,"chain_id": chain_id})
+                    "ml_i": 0,"amount": base_amount,"chain_id": chain_id,
+                    "entry_dt": entry_dt})
     last_signal_utc = now_utc
     print(f"[SIGNAL] {pair} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} "
           f"| ML {sig.get('ml_levels', [])} (chain={chain_id})")
