@@ -2,6 +2,7 @@
 # Fix: Anchor entry_time to msg_date ET, prevent ERROR_NO_TRADE from triggering ML
 # Patch: Add SKEW_MS, ML1_GAP_S, ML2_GAP_S offsets from .env
 # Patch: Add chain_id tracking to isolate each trade chain, reset cleanly on win or full loss
+# Patch: Validate close_time from executor against expected expiry
 
 import os, re, csv, asyncio, sys, requests, uuid
 from datetime import datetime, timedelta, timezone
@@ -51,13 +52,14 @@ LOG_FILE = "trade_log.csv"
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", newline="") as f:
         csv.writer(f).writerow(
-            ["ts_utc","pair","direction","expiry_min","amount","result","profit","ml_tag","chain_id"]
+            ["ts_utc","pair","direction","expiry_min","amount","result","profit","ml_tag","chain_id","close_time"]
         )
 
-def log_trade(pair, direction, expiry_min, amount, result, profit, ml_tag="", chain_id=""):
+def log_trade(pair, direction, expiry_min, amount, result, profit, ml_tag="", chain_id="", close_time=""):
     with open(LOG_FILE, "a", newline="") as f:
         csv.writer(f).writerow([
-            datetime.utcnow().isoformat(), pair, direction, expiry_min, amount, result, profit, ml_tag, chain_id
+            datetime.utcnow().isoformat(), pair, direction, expiry_min, amount,
+            result, profit, ml_tag, chain_id, close_time
         ])
 
 # --- Parsing ---
@@ -138,6 +140,17 @@ def et_day_key() -> str:
     now_et = now_utc + timedelta(minutes=tz_offset_minutes)
     return now_et.strftime("%Y-%m-%d")
 
+def is_close_time_valid(expected_dt: datetime, reported_str: str) -> bool:
+    """Check if reported close_time matches expected expiry within ±90s tolerance."""
+    try:
+        hh, mm = map(int, reported_str.split(":"))
+        reported = expected_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if abs((reported - expected_dt).total_seconds()) < 90:
+            return True
+    except Exception as e:
+        print(f"[WARN] Close time parse failed: {reported_str} ({e})")
+    return False
+
 # --- Trade state ---
 current = {"active": False,"pair": None,"direction": None,"expiry_min": 5,
            "ml_levels": [],"ml_i": 0,"amount": base_amount,"chain_id": None}
@@ -177,7 +190,7 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None, chai
         clean_pair = f"{clean_pair} OTC"
 
     ml_tag = f"ML{ml_label}" if ml_label else "BASE"
-    result, profit = "ERROR", 0.0
+    result, profit, close_time = "ERROR", 0.0, ""
 
     try:
         res = requests.post(
@@ -190,6 +203,12 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None, chai
             data = res.json()
             result = data.get("result", "LOSS")
             profit = float(data.get("profit", 0))
+            close_time = data.get("close_time", "")
+
+            expected_close_dt = datetime.utcnow() + timedelta(minutes=expiry_min)
+            if close_time and not is_close_time_valid(expected_close_dt, close_time):
+                print(f"[WARN] Close time mismatch, ignoring row. expected≈{expected_close_dt.strftime('%H:%M')} got={close_time}")
+                result = "ERROR_NO_TRADE"
 
             if result == "ERROR_NO_TRADE":
                 result = "ERROR_NO_TRADE"
@@ -206,13 +225,13 @@ async def run_one_trade(pair, direction, expiry_min, amount, ml_label=None, chai
     finally:
         executor_busy = False
 
-    log_trade(clean_pair, direction, expiry_min, amount, result, profit, ml_tag, chain_id)
+    log_trade(clean_pair, direction, expiry_min, amount, result, profit, ml_tag, chain_id, close_time)
     daily_pnl += profit
     if DAILY_STOP_LOSS > 0 and daily_pnl <= -DAILY_STOP_LOSS:
         halted_for_day = True
         print(f"[HALT] Daily stop-loss reached. PnL={daily_pnl:.2f}, halting new trades.")
 
-    print(f"[API] Trade done: {direction} {clean_pair} ${amount} → {result} ({profit}) [{ml_tag}] (chain={chain_id})")
+    print(f"[API] Trade done: {direction} {clean_pair} ${amount} → {result} ({profit}) [{ml_tag}] (chain={chain_id}) close_time={close_time}")
     return result
 
 # --- ML scheduling ---
