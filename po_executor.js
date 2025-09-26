@@ -1,4 +1,4 @@
-// po_executor.js — Executor with overlay insurance (patched selectPair, 300s wait)
+// po_executor.js — Executor with overlay insurance + close time capture
 
 const path = require("path");
 const express = require("express");
@@ -24,7 +24,7 @@ const SEL = {
   sellBtn: '#put-call-buttons-chart-1 a.sell, #put-call-buttons-chart-1 button:has-text("Sell"), a.btn.btn-put',
 
   closedTab: 'li:has-text("Closed")',
-  closedRow: '.deals-list__item'
+  closedRow: '.deals-list__item' // full closed trade row
 };
 
 let context, page;
@@ -126,13 +126,11 @@ async function selectPair(pair) {
     return;
   }
 
-  // open overlay
   await withRetry(async () => {
     await toggle.click({ timeout: DEFAULT_TIMEOUT });
     await page.waitForSelector(SEL.assetOverlay, { state: 'visible', timeout: DEFAULT_TIMEOUT });
   }, 2, "open asset overlay");
 
-  // keep overlay open → search works
   const cleaned = pair.replace(" OTC", "").replace("/", "").toLowerCase();
   const search = page.locator(SEL.searchInput).first();
   await withRetry(async () => { await search.fill(cleaned); }, 2, "search fill");
@@ -142,18 +140,17 @@ async function selectPair(pair) {
   await withRetry(async () => { await listItem.click({ timeout: DEFAULT_TIMEOUT }); }, 2, "select list item");
 
   console.log(`[Step] Selected pair: ${pair}`);
-  // now close overlays after pair is chosen
   await forceCloseOverlays();
   await sleep(1000);
 }
 
 // ----------------------------- Logging --------------------------------------
-function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "") {
-  const header = "Time,Pair,Dir,Amount,Result,Profit,ML_Tag\n";
+function appendLog(ts, pair, dir, amount, result, profit, ml_tag = "", close_time = "") {
+  const header = "Time,Pair,Dir,Amount,Result,Profit,ML_Tag,CloseTime\n";
   if (!fs.existsSync(LOG_FILE)) {
     fs.writeFileSync(LOG_FILE, header);
   }
-  fs.appendFileSync(LOG_FILE, `${ts},${pair},${dir},${amount},${result},${profit},${ml_tag}\n`);
+  fs.appendFileSync(LOG_FILE, `${ts},${pair},${dir},${amount},${result},${profit},${ml_tag},${close_time}\n`);
 }
 
 // ----------------------------- Trade Core -----------------------------------
@@ -195,8 +192,8 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
 
   console.log(`[✅] Trade executed: ${direction.toUpperCase()} on ${pair} for $${amount} ${ml_tag ? `[${ml_tag}]` : ""}`);
 
-  // shortened wait from 305s → 300s
-  await sleep(300000);
+  // wait slightly longer to ensure row exists
+  await sleep(301000);
 
   await forceCloseOverlays();
   await page.locator(SEL.closedTab).click({ timeout: 5000 }).catch(() => {
@@ -209,6 +206,15 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
   console.log(`[Debug] Closed row text: ${rowText}`);
 
+  // extract close time
+  let close_time = "";
+  try {
+    close_time = await row.locator("div.item-row + div").first().innerText();
+    close_time = close_time.trim();
+  } catch {
+    close_time = "";
+  }
+
   let profit = 0.0, result = "LOSS";
   const profitMatches = rowText.match(/\$[0-9.]+/g);
   if (profitMatches && profitMatches.length > 0) {
@@ -218,12 +224,12 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   }
 
   const ts = new Date().toISOString();
-  appendLog(ts, pair, direction, amount, result, profit, ml_tag);
+  appendLog(ts, pair, direction, amount, result, profit, ml_tag, close_time);
 
-  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} ${ml_tag ? `[${ml_tag}]` : ""}`);
+  console.log(`[Result] ${result} ${pair} ${direction} $${amount} profit=${profit} close_time=${close_time} ${ml_tag ? `[${ml_tag}]` : ""}`);
 
   tradeInProgress = false;
-  return { success: true, result, profit, ml_tag };
+  return { success: true, result, profit, close_time, ml_tag };
 }
 
 // ----------------------------- Browser Init ---------------------------------
