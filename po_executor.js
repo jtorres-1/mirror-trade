@@ -206,12 +206,19 @@ async function placeTrade(pair, amount, direction, ml_tag = "") {
   const rowText = (await row.innerText()).replace(/\n/g, " ").trim();
   console.log(`[Debug] Closed row text: ${rowText}`);
 
-  // extract close time (regex-safe)
+  // extract close time (regex-safe + UTC normalize)
   let close_time = "";
   try {
     const firstRowText = await row.locator("div.item-row").first().innerText();
     const match = firstRowText.match(/\d{1,2}:\d{2}/);
-    if (match) close_time = match[0];
+    if (match) {
+      const [hh, mm] = match[0].split(":").map(Number);
+      const now = new Date();
+      const reported = new Date(now);
+      // adjust ET (platform) → UTC (+4 hours normally, can adjust via env if needed)
+      reported.setUTCHours(hh + 4, mm, 0, 0);
+      close_time = reported.toISOString().substring(11, 16); // "HH:MM" in UTC
+    }
   } catch {
     close_time = "";
   }
