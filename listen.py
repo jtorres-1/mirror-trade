@@ -281,8 +281,8 @@ async def schedule_entry(entry_dt: datetime, ml_label=None):
     if current["ml_i"] < len(current["ml_levels"]):
         next_t = current["ml_levels"][current["ml_i"]]
         current["ml_i"] += 1
-        if current["ml_i"] >= 3:
-            print("[ML] ML3 disabled; chain ends at ML2.")
+        if current["ml_i"] >= 4:
+            print("[ML] ML4 disabled; chain ends at ML3.")
             reset_chain()
             return
         next_amt = round(current["amount"] * mg_mult, 2)
