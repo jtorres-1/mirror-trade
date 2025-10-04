@@ -3,6 +3,7 @@
 # Patch: Add SKEW_MS, ML1_GAP_S, ML2_GAP_S offsets from .env
 # Patch: Add chain_id tracking to isolate each trade chain, reset cleanly on win or full loss
 # Patch: Validate close_time from executor against expected expiry (anchored to entry_dt)
+# Patch: Add time-based sleep window (22:00–06:30 UTC = 3 PM–11:30 PM PST)
 
 import os, re, csv, asyncio, sys, requests, uuid
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,27 @@ SKEW_MS = int(os.getenv("SKEW_MS", "0"))
 ML1_GAP_S = float(os.getenv("ML1_GAP_S", "3"))
 ML2_GAP_S = float(os.getenv("ML2_GAP_S", "3"))
 
+# --- Trading session window (UTC) ---
+WIN_START_UTC = os.getenv("WIN_START_UTC", "22:00")   # 22:00 UTC = 3 PM PST
+WIN_END_UTC   = os.getenv("WIN_END_UTC", "06:30")     # 06:30 UTC = 11:30 PM PST
+
+def _to_minutes(hhmm: str) -> int:
+    h, m = map(int, hhmm.split(":"))
+    return h * 60 + m
+
+START_MIN = _to_minutes(WIN_START_UTC)
+END_MIN   = _to_minutes(WIN_END_UTC)
+
+def within_trade_window_utc(dt_utc: datetime=None) -> bool:
+    """Return True if within allowed window (handles midnight crossover)."""
+    if dt_utc is None:
+        dt_utc = datetime.utcnow()
+    total = dt_utc.hour * 60 + dt_utc.minute
+    if START_MIN <= END_MIN:
+        return START_MIN <= total <= END_MIN
+    return total >= START_MIN or total <= END_MIN
+
+# --- Validation ---
 if not api_id or not api_hash:
     print("[FATAL] API_ID/API_HASH missing in .env")
     sys.exit(1)
@@ -243,6 +265,11 @@ async def schedule_entry(entry_dt: datetime, ml_label=None):
         print("[HALT] Daily stop-loss reached; skip scheduled entry.")
         return
 
+    # ensure trade is within allowed UTC window
+    if not within_trade_window_utc(entry_dt):
+        print(f"[SLEEP] Scheduled entry {entry_dt} UTC outside allowed window; skipping.")
+        return
+
     # Apply skew/gaps
     if ml_label is None:  # Base
         entry_dt -= timedelta(milliseconds=SKEW_MS)
@@ -262,7 +289,6 @@ async def schedule_entry(entry_dt: datetime, ml_label=None):
 
     result = await run_one_trade(pair, direction, expiry, amt, entry_dt, ml_label=ml_label, chain_id=chain_id)
 
-    # Reset logic tied to this chain only
     if result == "WIN":
         print("[ML] WIN → reset to base")
         reset_chain()
@@ -273,7 +299,6 @@ async def schedule_entry(entry_dt: datetime, ml_label=None):
         reset_chain()
         return
 
-    # Only continue ML if true LOSS, within same chain
     if chain_id != current["chain_id"]:
         print("[ML] Stale result ignored (mismatched chain_id).")
         return
@@ -300,6 +325,11 @@ async def handle_signal_from_text(text: str, msg_date=None):
     sig = parse_signal(text)
     if not sig: return False
     if not msg_date: msg_date = datetime.utcnow().replace(tzinfo=timezone.utc)
+
+    # prevent new trades outside UTC window
+    if not within_trade_window_utc(datetime.utcnow()):
+        print(f"[SLEEP] Outside trading hours {WIN_START_UTC}-{WIN_END_UTC} UTC; ignoring signal.")
+        return True
 
     entry_dt = resolve_entry_datetime(sig["entry_time"], msg_date.replace(tzinfo=None))
 
