@@ -4,6 +4,7 @@
 # Patch: Add chain_id tracking to isolate each trade chain, reset cleanly on win or full loss
 # Patch: Validate close_time from executor against expected expiry (anchored to entry_dt)
 # Patch: Add time-based sleep window (22:00–06:30 UTC = 3 PM–11:30 PM PST)
+# Patch: Add pair filter for volatile pairs (JPY/AUD crosses)
 
 import os, re, csv, asyncio, sys, requests, uuid
 from datetime import datetime, timedelta, timezone
@@ -53,6 +54,12 @@ def within_trade_window_utc(dt_utc: datetime=None) -> bool:
     if START_MIN <= END_MIN:
         return START_MIN <= total <= END_MIN
     return total >= START_MIN or total <= END_MIN
+
+# --- Pair filter ---
+BLOCKED_PAIRS = [
+    "GBP/JPY", "USD/JPY", "AUD/JPY", "EUR/JPY",
+    "GBP/AUD", "EUR/AUD"
+]
 
 # --- Validation ---
 if not api_id or not api_hash:
@@ -323,12 +330,19 @@ async def schedule_entry(entry_dt: datetime, ml_label=None):
 async def handle_signal_from_text(text: str, msg_date=None):
     global last_signal_utc, daily_pnl, halted_for_day
     sig = parse_signal(text)
-    if not sig: return False
-    if not msg_date: msg_date = datetime.utcnow().replace(tzinfo=timezone.utc)
+    if not sig:
+        return False
+    if not msg_date:
+        msg_date = datetime.utcnow().replace(tzinfo=timezone.utc)
 
     # prevent new trades outside UTC window
     if not within_trade_window_utc(datetime.utcnow()):
         print(f"[SLEEP] Outside trading hours {WIN_START_UTC}-{WIN_END_UTC} UTC; ignoring signal.")
+        return True
+
+    # block unwanted pairs
+    if sig["pair"] in BLOCKED_PAIRS:
+        print(f"[FILTER] {sig['pair']} blocked; ignoring signal.")
         return True
 
     entry_dt = resolve_entry_datetime(sig["entry_time"], msg_date.replace(tzinfo=None))
@@ -341,7 +355,8 @@ async def handle_signal_from_text(text: str, msg_date=None):
         handle_signal_from_text._day = et_day_key()
     cur_day = et_day_key()
     if cur_day != handle_signal_from_text._day:
-        daily_pnl = 0.0; halted_for_day = False
+        daily_pnl = 0.0
+        halted_for_day = False
         handle_signal_from_text._day = cur_day
         print(f"[INFO] New ET day {cur_day}: daily PnL reset.")
 
@@ -367,8 +382,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
                     "ml_i": 0,"amount": base_amount,"chain_id": chain_id,
                     "entry_dt": entry_dt})
     last_signal_utc = now_utc
-    print(f"[SIGNAL] {pair} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} "
-          f"| ML {sig.get('ml_levels', [])} (chain={chain_id})")
+    print(f"[SIGNAL] {pair} {sig['direction']} {sig['expiry_min']}m entry {sig['entry_time']} | ML {sig.get('ml_levels', [])} (chain={chain_id})")
     task = asyncio.create_task(schedule_entry(entry_dt))
     scheduled_tasks.append(task)
     return True
@@ -384,7 +398,8 @@ async def on_signal(e):
     text = (e.message.message or "").strip()
     print("[TG RAW]", text.replace("\n", " | ")[:500])
     ok = await handle_signal_from_text(text, msg_date=e.message.date)
-    if not ok: print("[TG DEBUG] Ignored: no valid signal found")
+    if not ok:
+        print("[TG DEBUG] Ignored: no valid signal found")
 
 # --- Main ---
 async def main():
