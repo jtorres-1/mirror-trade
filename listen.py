@@ -275,6 +275,16 @@ async def schedule_entry(entry_dt: datetime, ml_label=None):
     # ensure trade is within allowed UTC window
     if not within_trade_window_utc(entry_dt):
         print(f"[SLEEP] Scheduled entry {entry_dt} UTC outside allowed window; skipping.")
+
+        # --- AUTO-RESET EDGE CASE FIX ---
+        # If an entry (typically ML1/ML2) is skipped due to session cutoff,
+        # the current chain could remain active and block new-day signals.
+        # Reset cleanly here to start fresh next session.
+        if current.get("active", False):
+            print("[RESET] Active chain closed due to out-of-window restriction.")
+            reset_chain()
+        # ---------------------------------
+
         return
 
     # Apply skew/gaps
@@ -337,7 +347,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
 
     # prevent new trades outside UTC window
     if not within_trade_window_utc(datetime.utcnow()):
-        print(f"[SLEEP] Outside trading hours {WIN_START_UTC}-{WIN_END_UTC} UTC; ignoring signal.")
+        print(f("[SLEEP] Outside trading hours {WIN_START_UTC}-{WIN_END_UTC} UTC; ignoring signal."))
         return True
 
     # block unwanted pairs
