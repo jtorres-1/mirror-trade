@@ -347,7 +347,7 @@ async def handle_signal_from_text(text: str, msg_date=None):
 
     # prevent new trades outside UTC window
     if not within_trade_window_utc(datetime.utcnow()):
-        print(f("[SLEEP] Outside trading hours {WIN_START_UTC}-{WIN_END_UTC} UTC; ignoring signal."))
+        print(f"[SLEEP] Outside trading hours {WIN_START_UTC}-{WIN_END_UTC} UTC; ignoring signal.")
         return True
 
     # block unwanted pairs
