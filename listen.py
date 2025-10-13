@@ -58,8 +58,9 @@ def within_trade_window_utc(dt_utc: datetime=None) -> bool:
 # --- Pair filter ---
 BLOCKED_PAIRS = [
     "GBP/JPY", "USD/JPY", "AUD/JPY", "EUR/JPY",
-    "GBP/AUD", "EUR/AUD"
+    "GBP/AUD", "EUR/AUD", "EUR/GBP"
 ]
+
 
 # --- Validation ---
 if not api_id or not api_hash:
